@@ -2,17 +2,18 @@
 Train PocketPaint's own tiny generative model.
 
 The model is a CONDITIONAL NEURAL FIELD (a small MLP / CPPN):
-    input  = [ Fourier(x,y) , x, y, r , condition_vector(17) ]   (44 dims)
+    input  = [ Fourier(x,y) , x, y, r , condition_vector(21) ]   (48 dims)
     output = RGB at that pixel                                    (3 dims)
 
 It is trained by DISTILLING a hand-written analytic "scene renderer" R(x,y,c):
 the renderer composes recognizable landscapes (sky by time-of-day, ground by
 biome, optional mountains / neon / fire) AND simple silhouette SUBJECTS
-(person / horse / tree / building, placed on the ground) from a 17-D semantic
-condition vector. Because R is smooth and deterministic, a small MLP can learn
-to reproduce it and then generalize/interpolate across conditions — giving us
-a real, trained neural generator that is only ~30k params, renders at any
-resolution, and runs in the browser (plain JS) with zero downloads.
+(person / horse / dog / car / bird / boat / tree / building, placed on the
+ground or sky) from a 21-D semantic condition vector. Because R is smooth and
+deterministic, a small MLP can learn to reproduce it and then
+generalize/interpolate across conditions — giving us a real, trained neural
+generator that is only ~32k params, renders at any resolution, and runs in
+the browser (plain JS) with zero downloads.
 
 Outputs: model.json (weights) consumed by the web app, plus a few preview
 PNGs so we can eyeball quality before shipping.
@@ -28,9 +29,10 @@ rng = np.random.default_rng(0)
 #  4 ocean     5 forest    6 desert    7 snow      8 plain   (ground biome)
 #  9 mountains 10 neon     11 fire
 #  12 person   13 horse    14 tree     15 building        (subjects, on ground)
+#  17 dog      18 car      19 bird     20 boat             (more subjects)
 #  16 subj_x   (0..1, horizontal placement of the subject group, default 0.5)
 # ----------------------------------------------------------------------------
-CDIM = 17
+CDIM = 21
 HORIZON = 0.58
 
 def _mix(a, b, t):
@@ -86,11 +88,55 @@ def building_mask(u, v):
     roof = soft_rect(u, v - 0.82, 0.34, 0.06)
     return np.maximum(body, roof)
 
+def dog_mask(u, v):
+    legs = np.maximum.reduce([
+        soft_rect(u + 0.20, v - 0.10, 0.03, 0.10),
+        soft_rect(u + 0.08, v - 0.10, 0.03, 0.10),
+        soft_rect(u - 0.08, v - 0.10, 0.03, 0.10),
+        soft_rect(u - 0.20, v - 0.10, 0.03, 0.10),
+    ])
+    body = soft_ellipse(u, v - 0.30, 0.24, 0.13)
+    head = soft_circle(u - 0.26, v - 0.40, 0.11)
+    tail = soft_circle(u + 0.30, v - 0.36, 0.06)
+    return np.maximum.reduce([legs, body, head, tail])
+
+def car_mask(u, v):
+    body = soft_rect(u, v - 0.20, 0.32, 0.12)
+    cabin = soft_rect(u - 0.04, v - 0.32, 0.18, 0.10)
+    wheel1 = soft_circle(u - 0.20, v - 0.08, 0.08)
+    wheel2 = soft_circle(u + 0.20, v - 0.08, 0.08)
+    return np.maximum.reduce([body, cabin, wheel1, wheel2])
+
+def boat_mask(u, v):
+    hull = soft_rect(u, v - 0.06, 0.28, 0.07)
+    mast = soft_rect(u, v - 0.28, 0.018, 0.22)
+    sail = soft_rect(u + 0.08, v - 0.32, 0.10, 0.14)
+    return np.maximum.reduce([hull, mast, sail])
+
+def bird_mask(u, v):
+    body = soft_ellipse(u, v, 0.08, 0.05)
+    wing1 = soft_ellipse(u - 0.16, v + 0.03, 0.15, 0.045)
+    wing2 = soft_ellipse(u + 0.16, v + 0.03, 0.15, 0.045)
+    return np.maximum.reduce([body, wing1, wing2])
+
 def place(x, y, cx, scale):
     """Local coords for a subject standing at (cx, ground) with given scale."""
     baseline = HORIZON + 0.018
     u = (x - cx) / scale
     v = (baseline - y) / scale
+    return u, v
+
+def place_float(x, y, cx, scale, sink=0.0):
+    """Like place() but the baseline can sit above/below the horizon (boats)."""
+    baseline = HORIZON + sink
+    u = (x - cx) / scale
+    v = (baseline - y) / scale
+    return u, v
+
+def place_sky(x, y, cx, cy, scale):
+    """Local coords for something floating in the sky at (cx, cy)."""
+    u = (x - cx) / scale
+    v = (cy - y) / scale
     return u, v
 
 def render(x, y, c):
@@ -102,6 +148,7 @@ def render(x, y, c):
     ocean = c[..., 4]; forest = c[..., 5]; desert = c[..., 6]; snow = c[..., 7]; plain = c[..., 8]
     mount = c[..., 9]; neon = c[..., 10]; fire = c[..., 11]
     person = c[..., 12]; horse = c[..., 13]; tree = c[..., 14]; building = c[..., 15]
+    dog = c[..., 17]; car = c[..., 18]; bird = c[..., 19]; boat = c[..., 20]
     subj_x = c[..., 16] * 0.5 + 0.25  # keep group roughly within frame [0.25,0.75]
 
     sky_w = night + sunset + day + over + 1e-3
@@ -191,9 +238,25 @@ def render(x, y, c):
     bm = building_mask(ub, vb)
     paint(np.clip(bm * building, 0, 1), (0.32, 0.30, 0.34))
 
+    ubo, vbo = place_float(x, y, np.clip(subj_x - 0.30, 0.08, 0.92), 0.30, sink=-0.01)
+    bom = boat_mask(ubo, vbo)
+    paint(np.clip(bom * boat, 0, 1), (0.35, 0.22, 0.10))
+
+    uc, vc = place(x, y, np.clip(subj_x + 0.18, 0.08, 0.92), 0.26)
+    cm = car_mask(uc, vc)
+    paint(np.clip(cm * car, 0, 1), (0.65, 0.10, 0.10))
+
     uh, vh = place(x, y, np.clip(subj_x + 0.05, 0.08, 0.92), 0.22)
     hm = horse_mask(uh, vh)
     paint(np.clip(hm * horse, 0, 1), (0.32, 0.20, 0.12))
+
+    ud, vd = place(x, y, np.clip(subj_x - 0.10, 0.08, 0.92), 0.14)
+    dm = dog_mask(ud, vd)
+    paint(np.clip(dm * dog, 0, 1), (0.55, 0.42, 0.25))
+
+    ubr, vbr = place_sky(x, y, np.clip(subj_x + 0.15, 0.1, 0.9), HORIZON * 0.35, 0.10)
+    brm = bird_mask(ubr, vbr)
+    paint(np.clip(brm * bird, 0, 1), (0.08, 0.08, 0.10))
 
     up, vp = place(x, y, subj_x, 0.30)
     pm = person_mask(up, vp)
@@ -227,11 +290,15 @@ def sample_conditions(n):
     c[:, 11] = (rng.random(n) < 0.18) * rng.uniform(0.4, 1.0, n)  # fire
     # subjects: each independently has a chance to appear; bias toward at
     # least one subject often so the net sees plenty of foreground examples.
-    c[:, 12] = (rng.random(n) < 0.30) * rng.uniform(0.7, 1.0, n)  # person
-    c[:, 13] = (rng.random(n) < 0.25) * rng.uniform(0.7, 1.0, n)  # horse
-    c[:, 14] = (rng.random(n) < 0.30) * rng.uniform(0.7, 1.0, n)  # tree
-    c[:, 15] = (rng.random(n) < 0.20) * rng.uniform(0.7, 1.0, n)  # building
+    c[:, 12] = (rng.random(n) < 0.25) * rng.uniform(0.7, 1.0, n)  # person
+    c[:, 13] = (rng.random(n) < 0.20) * rng.uniform(0.7, 1.0, n)  # horse
+    c[:, 14] = (rng.random(n) < 0.25) * rng.uniform(0.7, 1.0, n)  # tree
+    c[:, 15] = (rng.random(n) < 0.16) * rng.uniform(0.7, 1.0, n)  # building
     c[:, 16] = rng.uniform(0.0, 1.0, n)                            # subj_x
+    c[:, 17] = (rng.random(n) < 0.18) * rng.uniform(0.7, 1.0, n)  # dog
+    c[:, 18] = (rng.random(n) < 0.16) * rng.uniform(0.7, 1.0, n)  # car
+    c[:, 19] = (rng.random(n) < 0.18) * rng.uniform(0.7, 1.0, n)  # bird
+    c[:, 20] = (rng.random(n) < 0.14) * rng.uniform(0.7, 1.0, n)  # boat
     # small noise + clamp
     c = np.clip(c + rng.normal(0, 0.03, c.shape), 0, 1)
     return c
@@ -289,7 +356,7 @@ def adam(grads, t, lr=2e-3, b1=0.9, b2=0.999, eps=1e-8):
 # ----------------------------------------------------------------------------
 # Training loop: fresh analytic data each step (infinite dataset).
 # ----------------------------------------------------------------------------
-STEPS = 9000
+STEPS = 8000
 NC = 96            # conditions per batch
 NP = 192           # pixels per condition  -> batch = 18432
 t0 = time.time()
@@ -324,13 +391,18 @@ for step in range(1, STEPS + 1):
 print("trained in %.1fs" % (time.time() - t0))
 
 # ----------------------------------------------------------------------------
-# Export weights to JSON (float values; the web app reads them directly).
+# Export weights, packed exactly the way index.html's #pp-model expects:
+# float32 tensors concatenated in `order` and base64-encoded.
 # ----------------------------------------------------------------------------
+import base64
 meta = {"DIM": DIM, "H": H, "K": K, "CDIM": CDIM, "HORIZON": HORIZON}
-weights = {k: P[k].astype(np.float32).ravel().tolist() for k in P}
-with open("model.json", "w") as f:
-    json.dump({"meta": meta, "weights": weights}, f)
-print("saved model.json  (params:", sum(P[k].size for k in P), ")")
+order = ["W0", "b0", "W1", "b1", "W2", "b2", "W3", "b3"]
+shapes = {k: list(P[k].shape) for k in order}
+buf = b"".join(P[k].astype(np.float32).ravel().tobytes() for k in order)
+b64 = base64.b64encode(buf).decode("ascii")
+with open("model_web.json", "w") as f:
+    json.dump({"meta": meta, "order": order, "shapes": shapes, "b64": b64}, f)
+print("saved model_web.json  (params:", sum(P[k].size for k in P), ")")
 
 # ----------------------------------------------------------------------------
 # Minimal PNG writer (no PIL) + render previews from the TRAINED net.
@@ -358,7 +430,8 @@ def C(**kw):
     c = np.zeros(CDIM)
     idx = {"night":0,"sunset":1,"day":2,"overcast":3,"ocean":4,"forest":5,
            "desert":6,"snow":7,"plain":8,"mountains":9,"neon":10,"fire":11,
-           "person":12,"horse":13,"tree":14,"building":15,"subj_x":16}
+           "person":12,"horse":13,"tree":14,"building":15,"subj_x":16,
+           "dog":17,"car":18,"bird":19,"boat":20}
     for k, val in kw.items():
         c[idx[k]] = val
     if "subj_x" not in kw:
@@ -374,6 +447,10 @@ previews = {
     "horse_pasture": C(day=1, plain=1, horse=1),
     "village_day":   C(day=1, plain=1, building=1, tree=0.6),
     "person_horse_sunset": C(sunset=1, plain=1, person=1, horse=1, subj_x=0.4),
+    "dog_park":      C(day=1, plain=1, dog=1, tree=0.6),
+    "road_car":      C(day=1, desert=1, car=1),
+    "sailing_boat":  C(day=1, ocean=1, boat=1, bird=0.8),
+    "birds_at_sunset": C(sunset=1, ocean=1, bird=1),
 }
 for name, c in previews.items():
     write_png(f"preview_{name}.png", net_render(c, 160))

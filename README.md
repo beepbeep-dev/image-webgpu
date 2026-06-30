@@ -33,40 +33,49 @@ The app ships **three engines**. The default is **my own neural network, trained
 from scratch** specifically to fit this 3 GB / iPad-9 target.
 
 ### A. 🧬 Neural model — DEFAULT (I trained this myself)
-- **What it is:** a **~23,000-parameter conditional neural field** (a small MLP /
-  CPPN). It takes `(x, y)` pixel coordinates — Fourier-encoded — plus a **12-D
+- **What it is:** a **~31,000-parameter conditional neural field** (a small MLP /
+  CPPN). It takes `(x, y)` pixel coordinates — Fourier-encoded — plus a **21-D
   semantic condition vector** and outputs the RGB colour at that pixel:
 
   ```
-  input  = [ Fourier(x,y, 6 octaves), x, y, r, condition(12) ]   (39 dims)
-  hidden = 39 → 96 → 96 → 96   (tanh)
+  input  = [ Fourier(x,y, 6 octaves), x, y, r, condition(21) ]   (48 dims)
+  hidden = 48 → 112 → 112 → 112   (tanh)
   output = 3 (sigmoid → RGB)
   ```
 
-- **How it was trained** (`model/train.py`, pure NumPy, no GPU, ~10 min on CPU):
-  I wrote an analytic **scene renderer** that composes recognizable landscapes —
-  sky by **time of day** (night / sunset / day / overcast), ground by **biome**
-  (ocean / forest / desert / snow / plain), plus optional **mountains / neon /
-  fire** — from the 12-D condition. The network is trained by **distilling** that
-  renderer: each step samples fresh random conditions + pixels and regresses the
-  network's output to the renderer's (Adam, MSE). Final MSE ≈ `3e-4` (RMSE ≈ 0.017).
-- **How it runs in the browser:** the trained weights (`float32`, base64, ~120 KB)
+- **How it was trained** (`model/train.py`, pure NumPy, no GPU, ~19 min on CPU,
+  8000 steps): I wrote an analytic **scene renderer** that composes recognizable
+  scenes — sky by **time of day** (night / sunset / day / overcast), ground by
+  **biome** (ocean / forest / desert / snow / plain), optional **mountains / neon
+  / fire**, plus simple **silhouette subjects** standing/floating in the scene:
+  **person, horse, dog, car, bird, boat, tree, building** (procedurally drawn with
+  soft signed-distance shape primitives — legs, torsos, wheels, canopies, hulls,
+  etc. — and placed via a `subj_x` placement slot in the condition vector) — from
+  the 21-D condition. The network is trained by **distilling** that renderer: each
+  step samples fresh random conditions + pixels and regresses the network's output
+  to the renderer's (Adam, MSE). Final MSE ≈ `1.1e-3` (RMSE ≈ 0.034) — a bit higher
+  than the landscape-only version because the condition space is much larger now.
+- **How it runs in the browser:** the trained weights (`float32`, base64, ~165 KB)
   are **embedded directly in `index.html`** and decoded at startup. Your prompt is
-  mapped to the same 12-D condition the model learned, and the network is evaluated
+  mapped to the same 21-D condition the model learned, and the network is evaluated
   **per pixel** in optimized JavaScript (typed arrays), rendered at a capped
   internal resolution and upscaled (the field is smooth, so this looks clean). The
   JS forward pass is **bit-for-bit identical** to the Python training code (verified
-  against reference pixels).
+  against reference pixels, max diff ~1e-15).
 - **Why this design:** a real Stable-Diffusion model is **gigabytes** and cannot
   load in a ~1–1.5 GB iOS Safari tab. So instead of depending on a giant model, I
   **made my own tiny one** that is genuine neural-network inference, needs **zero
   downloads**, starts **instantly**, renders at **any resolution (≥256 px)**, and
   uses only a few MB of RAM — so it actually runs on an **iPad 9**.
 - **Honest limitation:** because it's tiny and trained to reproduce a procedural
-  scene generator, it produces **stylized landscapes**, not arbitrary photoreal
-  scenes. It genuinely understands the prompt *vocabulary* it was trained on
-  (times of day, biomes, mountains/neon/fire) and interpolates smoothly between
-  them. See sample outputs in `model/previews.png`.
+  scene generator, it produces **stylized scenes with simple silhouette subjects**,
+  not arbitrary photoreal images. It genuinely understands the prompt *vocabulary*
+  it was trained on (times of day, biomes, mountains/neon/fire, and the 8 subject
+  types above) and interpolates smoothly between them. Bigger/foreground subjects
+  (person, horse, tree, building) render clearly and recognizably; smaller ones
+  (dog, car, bird, boat) are lower-fidelity, soft colour blobs rather than crisp
+  shapes — a result of their tiny footprint in the training images. See sample
+  outputs in `model/previews.png`.
 
 ### B. ⚡ Procedural — WebGPU shader (broadest compatibility)
 - A hand-written **WebGPU** fragment shader (WGSL) with a **Canvas2D CPU fallback**:
@@ -131,7 +140,7 @@ The model is fully reproducible:
 
 ```bash
 pip install numpy
-python3 model/train.py          # ~10 min on CPU → writes model_web.json + previews
+python3 model/train.py          # ~19 min on CPU (8000 steps) → writes model_web.json + previews
 # then paste model_web.json's contents into the <script id="pp-model"> tag in index.html
 ```
 
