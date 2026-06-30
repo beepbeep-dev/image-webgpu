@@ -29,8 +29,9 @@ Output is **at least 256 × 256 px** (default size on low-memory devices) and up
 
 ## 2. Model / runtime chosen, and why
 
-The app ships **three engines**. The default is **my own neural network, trained
-from scratch** specifically to fit this 3 GB / iPad-9 target.
+The app ships **four engines**. The default is **my own neural network, trained
+from scratch** specifically to fit this 3 GB / iPad-9 target; there is also a
+**second, self-trained model** — a genuine small diffusion model (see section A2).
 
 ### A. 🧬 Neural model — DEFAULT (I trained this myself)
 - **What it is:** a **~31,000-parameter conditional neural field** (a small MLP /
@@ -76,6 +77,60 @@ from scratch** specifically to fit this 3 GB / iPad-9 target.
   (dog, car, bird, boat) are lower-fidelity, soft colour blobs rather than crisp
   shapes — a result of their tiny footprint in the training images. See sample
   outputs in `model/previews.png`.
+
+### A2. 🌀 Diffusion (ours) — a SECOND model I trained myself, a real diffusion model
+- **What it is:** unlike the neural field above (which maps coordinates straight
+  to RGB), this is a genuine **DDPM/DDIM diffusion model** — a small conditional
+  **convolutional UNet** trained to predict the noise added to a 32×32 image at
+  a random timestep, then sampled by iterative denoising starting from pure
+  Gaussian noise. It is a real instance of the same family of model SD-Turbo
+  belongs to, just tiny: **~428,000 parameters**, working resolution 32×32
+  (upscaled to the requested output size).
+
+  ```
+  UNet: 32×32 → (down, stride-2 conv) 16×16 → (down) 8×8 → mid (2 FiLM ResBlocks)
+        → (up, nearest+conv, skip-concat) 16×16 → (up) 32×32 → 3ch noise pred
+  Each level: FiLM residual block — conv3x3 → SiLU → FiLM(scale,shift from
+  timestep+condition embedding) → SiLU → conv3x3 → + residual
+  Conditioning: sinusoidal timestep embedding + the same 21-D semantic
+  condition vector as the neural model, summed and fed to every FiLM block
+  channel count: 28 → 44 → 64 (down/up), embedding dim 96
+  ```
+
+- **How it was trained** (`model/train_diffusion.py` + `model/scene_diffusion.py`,
+  PyTorch, CPU-only, 4000 steps, batch 48, ~13 min): I wrote a second analytic
+  renderer (simpler/blockier than the neural model's — silhouettes built from
+  circles and rectangles, since a conv UNet picks up local shapes well even at
+  low fidelity) covering the same 21-D condition space (time of day, biome,
+  mountains/neon/fire, and 8 subjects). Standard DDPM training: sample a random
+  timestep `t`, add the corresponding amount of Gaussian noise to a fresh
+  rendered image, train the UNet to predict that noise (Adam, MSE, gradient
+  clipping, linear-warmup learning rate — without clipping the run diverged
+  once around step 1000, a real failure I hit and fixed during training).
+  Linear beta schedule (`1e-4 → 0.02`, T=1000), matching standard DDPM.
+- **How it runs in the browser:** the trained weights (float32, base64,
+  ~1.7 MB) are embedded in this file (`#pp-diffusion-model`) and decoded on
+  first use. Generation runs genuine iterative denoising — **DDIM sampling**,
+  using the Steps slider (1–20) as the number of denoising steps — fully
+  client-side in plain JavaScript (conv2d, FiLM, nearest-upsample all
+  hand-implemented as typed-array loops; no WebGPU/WASM/ONNX dependency, so it
+  runs on literally any device this app supports, including the iPad 9). The
+  JS forward pass mirrors the PyTorch `model.py` module structure exactly
+  (same op order, same weight layout).
+- **Why this is a genuinely different thing from the 🧬 Neural model:** it's
+  not just a relabeled version of the same idea — it's a different *class* of
+  generative model (score/noise-prediction + iterative refinement, the same
+  paradigm as Stable Diffusion) trained with a different objective, a
+  convolutional architecture instead of a per-pixel field, and a real sampling
+  loop instead of one forward pass.
+- **Honest limitation:** at 32×32 working resolution and ~428k parameters,
+  output is blocky/abstract up close — upscaling smooths it but doesn't add
+  detail. It also took noticeably longer to get training stable (the loss
+  diverged once before I added gradient clipping); the diffusion objective is
+  less forgiving than the neural field's direct regression. It's offered
+  alongside the neural model precisely so you can see the difference between
+  the two model families running side by side, both made from scratch, both
+  fully local.
 
 ### B. ⚡ Procedural — WebGPU shader (broadest compatibility)
 - A hand-written **WebGPU** fragment shader (WGSL) with a **Canvas2D CPU fallback**:
@@ -222,3 +277,10 @@ python3 model/train.py          # ~19 min on CPU (8000 steps) → writes model_w
 - `model/train.py` — trains the neural model from scratch (pure NumPy).
 - `model/model_web.json` — exported weights (also embedded in `index.html`).
 - `model/previews.png` — sample outputs from the trained model.
+- `model/scene_diffusion.py` — analytic scene+subject renderer used as the
+  diffusion model's training target (PyTorch + NumPy).
+- `model/model.py` — the small conditional UNet architecture (PyTorch).
+- `model/train_diffusion.py` — trains the diffusion model from scratch
+  (PyTorch, CPU) and exports `model/diffusion_model.json`.
+- `model/diffusion_model.json` — exported diffusion model weights (also
+  embedded in `index.html`).
