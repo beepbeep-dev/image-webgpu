@@ -78,13 +78,14 @@ from scratch** specifically to fit this 3 GB / iPad-9 target; there is also a
   shapes — a result of their tiny footprint in the training images. See sample
   outputs in `model/previews.png`.
 
-### A2. 🌀 Diffusion (ours) — a SECOND model I trained myself, a real diffusion model
+### A2. 🌀 Diffusion (ours) — a SECOND model I trained myself, on REAL scraped photos
 - **What it is:** unlike the neural field above (which maps coordinates straight
-  to RGB), this is a genuine **DDPM/DDIM diffusion model** — a small conditional
-  **convolutional UNet** trained to predict the noise added to a 32×32 image at
-  a random timestep, then sampled by iterative denoising starting from pure
-  Gaussian noise. It is a real instance of the same family of model SD-Turbo
-  belongs to, just tiny: **~428,000 parameters**, working resolution 32×32
+  to RGB and is distilled from a hand-written analytic renderer), this is a
+  genuine **DDPM/DDIM diffusion model** — a small conditional **convolutional
+  UNet** trained to predict the noise added to a 32×32 image at a random
+  timestep, then sampled by iterative denoising starting from pure Gaussian
+  noise. It is a real instance of the same family of model SD-Turbo belongs
+  to, just tiny: **~469,000 parameters total**, working resolution 32×32
   (upscaled to the requested output size).
 
   ```
@@ -92,62 +93,72 @@ from scratch** specifically to fit this 3 GB / iPad-9 target; there is also a
         → (up, nearest+conv, skip-concat) 16×16 → (up) 32×32 → 3ch noise pred
   Each level: FiLM residual block — conv3x3 → SiLU → FiLM(scale,shift from
   timestep+condition embedding) → SiLU → conv3x3 → + residual
-  Conditioning: sinusoidal timestep embedding + the same 21-D semantic
-  condition vector as the neural model, summed and fed to every FiLM block
-  channel count: 28 → 44 → 64 (down/up), embedding dim 96
+  Conditioning: sinusoidal timestep embedding + a 48-D CAPTION embedding
+  (see below), summed and fed to every FiLM block
+  channel count: 28 → 44 → 64 (down/up), UNet embedding dim 96
   ```
 
-- **Trained from a real, structured database, not just random sampling**
-  (`model/build_dataset.py` → `model/dataset.db`, SQLite): rather than only
-  ever generating a fresh random scene every training step, I built an
-  actual training-data database that **exhaustively enumerates the
-  structural condition space** — every (4 time-of-day) × (5 biomes) ×
-  (3 mountain intensities) × (3 neon intensities) × (3 fire intensities) ×
-  (9 subjects, including "none") × (placement, when a subject is present)
-  combination — **13,500 rows**, each a real SQLite row with queryable
-  columns (`time_of_day`, `biome`, `mountain`, `neon`, `fire`, `subject`,
-  `subj_x`) plus the exact 21-D condition vector and a PNG-encoded 32×32
-  render, indexed on `time_of_day` / `biome` / `subject` so you can inspect
-  it directly (e.g. `SELECT * FROM samples WHERE biome='desert' AND
-  subject='horse'`). `model/train_diffusion.py` loads the whole database
-  into memory once and trains by sampling random *rows of it* each step
-  (with repetition — ~14 epochs over 4000 steps × batch 48), so the model
-  is genuinely fit to a fixed, inspectable dataset instead of an
-  unbounded random stream.
-- **How it was trained** (`model/train_diffusion.py` + `model/scene_diffusion.py`,
-  PyTorch, CPU-only, 4000 steps, batch 48, ~12 min): the renderer that built
-  the database (simpler/blockier than the neural model's — silhouettes built
-  from circles and rectangles, since a conv UNet picks up local shapes well
-  even at low fidelity) covers the same 21-D condition space (time of day,
-  biome, mountains/neon/fire, and 8 subjects). Standard DDPM training: sample
-  a random timestep `t`, add the corresponding amount of Gaussian noise to a
-  database image, train the UNet to predict that noise (Adam, MSE, gradient
-  clipping, linear-warmup learning rate — without clipping the run diverged
-  once around step 1000, a real failure I hit and fixed during training).
-  Linear beta schedule (`1e-4 → 0.02`, T=1000), matching standard DDPM.
-- **How it runs in the browser:** the trained weights (float32, base64,
-  ~1.7 MB) are embedded in this file (`#pp-diffusion-model`) and decoded on
-  first use. Generation runs genuine iterative denoising — **DDIM sampling**,
-  using the Steps slider (1–20) as the number of denoising steps — fully
-  client-side in plain JavaScript (conv2d, FiLM, nearest-upsample all
-  hand-implemented as typed-array loops; no WebGPU/WASM/ONNX dependency, so it
-  runs on literally any device this app supports, including the iPad 9). The
-  JS forward pass mirrors the PyTorch `model.py` module structure exactly
-  (same op order, same weight layout).
-- **Why this is a genuinely different thing from the 🧬 Neural model:** it's
-  not just a relabeled version of the same idea — it's a different *class* of
-  generative model (score/noise-prediction + iterative refinement, the same
-  paradigm as Stable Diffusion) trained with a different objective, a
-  convolutional architecture instead of a per-pixel field, and a real sampling
-  loop instead of one forward pass.
-- **Honest limitation:** at 32×32 working resolution and ~428k parameters,
-  output is blocky/abstract up close — upscaling smooths it but doesn't add
-  detail. It also took noticeably longer to get training stable (the loss
-  diverged once before I added gradient clipping); the diffusion objective is
-  less forgiving than the neural field's direct regression. It's offered
-  alongside the neural model precisely so you can see the difference between
-  the two model families running side by side, both made from scratch, both
-  fully local.
+- **Trained on a real, captioned photo database I scraped myself — not
+  synthetic renders.** `model/scrape_dataset.py` queries the **Wikimedia
+  Commons API** (115 search topics spanning nature, animals, vehicles,
+  cities, weather, people, plants...) and downloads real photographs with
+  their real captions/descriptions into `model/dataset_real.db` (SQLite,
+  **4,389 rows**: page id, query, title, caption, artist, license,
+  source URL, and a center-cropped 32×32 PNG). Every file on Wikimedia
+  Commons is required by Commons policy to be public domain or under a
+  free license permitting reuse and derivative works (no NC/ND content is
+  hosted there at all), so this is a legally clean source for training a
+  derivative model — full attribution (artist, license, source URL) is
+  kept per-row for transparency. A keyword filter drops obvious non-photos
+  (paintings, collages, maps, diagrams, screenshots) before they're saved.
+- **A tiny from-scratch TEXT ENCODER, also trained by me, replaces the
+  neural model's fixed category vector.** Instead of mapping prompts to a
+  hand-designed 21-D vector, this model learns its own **800-word
+  vocabulary** straight from the scraped captions and a **trainable word
+  embedding table** (48-D). A caption (or, at inference time, your prompt)
+  is tokenized with a trivial rule (lowercase, split on non-alphanumerics,
+  drop stopwords) and turned into one vector by **mean-pooling the
+  embeddings of its known words** — a minimal bag-of-words text encoder,
+  trained jointly with the UNet on the actual denoising loss, so the
+  vocabulary it ends up caring about is whatever the photos' real captions
+  actually used (`park`, `street`, `forest`, `sunset`, `mountain`, `horse`,
+  `desert`, ...).
+- **How it was trained** (`model/train_diffusion.py`, PyTorch, CPU-only,
+  6000 steps, batch 48, ~18 min): the whole database is decoded into memory
+  once; each step samples a random batch of real (image, caption) rows,
+  embeds the captions through the word-embedding table, adds noise at a
+  random timestep, and trains the UNet (+ text encoder, same optimizer) to
+  predict that noise — standard DDPM (Adam, MSE, gradient clipping,
+  linear-warmup learning rate; linear beta schedule `1e-4 → 0.02`, T=1000).
+- **How it runs in the browser:** the trained weights — UNet + the word
+  embedding table + the learned vocabulary — are embedded in this file
+  (`#pp-diffusion-model`, float32, base64, ~1.9 MB) and decoded on first
+  use. Your prompt is tokenized and embedded by a JS port of the exact
+  same rule (`promptToCaptionEmbedding`), then **DDIM sampling** (Steps
+  slider, 1–20 denoising steps) runs fully client-side in plain JavaScript
+  (conv2d, FiLM, nearest-upsample, embedding lookup all hand-implemented
+  as typed-array loops; no WebGPU/WASM/ONNX dependency, so it runs on
+  literally any device this app supports, including the iPad 9). Both the
+  UNet forward pass and the caption-embedding lookup were numerically
+  cross-checked against the PyTorch model (max abs diff ~1e-6 / exact
+  match respectively) before shipping.
+- **Why this is a genuinely different thing from the 🧬 Neural model:** different
+  training data (real scraped photographs vs. an analytic renderer), different
+  conditioning (a learned text encoder over real captions vs. a hand-designed
+  semantic vector), different *class* of generative model (score/noise-prediction
+  + iterative refinement, the same paradigm as Stable Diffusion, vs. a direct
+  coordinate→RGB field), and a real multi-step sampling loop instead of one
+  forward pass.
+- **Honest limitation:** at 32×32 working resolution, ~469k parameters, and
+  only ~4.4k real training photos (vs. millions for an actual Stable Diffusion),
+  output is abstract/impressionistic — it picks up rough color palette and
+  mood from the prompt (e.g. warm tones for "sunset", blue-black for "night
+  sky", green for "forest") but not sharp recognizable objects. Real-world
+  photos are a much harder training target than the neural model's clean
+  analytic renders, and this is an honest, tiny, from-scratch model, not a
+  scaled one. It's offered alongside the neural model precisely so you can
+  see the difference between the two model families and the two training
+  data sources, side by side, both made from scratch, both fully local.
 
 ### B. ⚡ Procedural — WebGPU shader (broadest compatibility)
 - A hand-written **WebGPU** fragment shader (WGSL) with a **Canvas2D CPU fallback**:
@@ -294,14 +305,14 @@ python3 model/train.py          # ~19 min on CPU (8000 steps) → writes model_w
 - `model/train.py` — trains the neural model from scratch (pure NumPy).
 - `model/model_web.json` — exported weights (also embedded in `index.html`).
 - `model/previews.png` — sample outputs from the trained model.
-- `model/scene_diffusion.py` — analytic scene+subject renderer used as the
-  diffusion model's training target (PyTorch + NumPy).
 - `model/model.py` — the small conditional UNet architecture (PyTorch).
-- `model/build_dataset.py` — builds `model/dataset.db`, a real SQLite
-  database that exhaustively renders the structural condition space
-  (13,500 rows).
-- `model/dataset.db` — the training dataset itself (SQLite, queryable).
-- `model/train_diffusion.py` — trains the diffusion model from
-  `model/dataset.db` (PyTorch, CPU) and exports `model/diffusion_model.json`.
-- `model/diffusion_model.json` — exported diffusion model weights (also
-  embedded in `index.html`).
+- `model/scrape_dataset.py` — scrapes `model/dataset_real.db`, a real SQLite
+  database of photos + captions from the Wikimedia Commons API (115 search
+  topics, 4,389 rows, public-domain/freely-licensed only).
+- `model/dataset_real.db` — the real training dataset itself (SQLite,
+  queryable: image, caption, artist, license, source URL per row).
+- `model/train_diffusion.py` — trains the diffusion model + its own small
+  word-embedding text encoder from `model/dataset_real.db` (PyTorch, CPU)
+  and exports `model/diffusion_model.json`.
+- `model/diffusion_model.json` — exported diffusion model weights, learned
+  vocabulary, and word embeddings (also embedded in `index.html`).

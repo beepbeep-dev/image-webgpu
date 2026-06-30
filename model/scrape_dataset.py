@@ -1,0 +1,215 @@
+"""
+Build a REAL, captioned training database by querying the Wikimedia Commons
+API (commons.wikimedia.org) — every file hosted there is required by Commons
+policy to be public domain or under a free license that permits commercial
+use and derivative works (no NC/ND content is allowed on Commons at all), so
+this is a legally clean source of real photographs with real captions for
+training a derivative model. We store full attribution (artist, license,
+source URL) per row for transparency.
+"""
+import html, io, json, re, sqlite3, sys, time
+import urllib.request, urllib.parse
+from PIL import Image
+
+API = "https://commons.wikimedia.org/w/api.php"
+UA = "PocketPaintDatasetBuilder/1.0 (research/education; contact: jasoncomerfordny@gmail.com)"
+THUMB_W = 96
+OUT_SIZE = 32
+
+QUERIES = [
+    "sunset sky", "sunrise sky", "starry night sky", "full moon night",
+    "desert dunes", "snowy mountain", "mountain range", "green meadow field",
+    "forest path", "pine forest", "autumn forest", "tropical beach",
+    "ocean waves", "calm lake", "waterfall", "river valley", "rolling hills",
+    "rainbow sky", "foggy morning", "storm clouds", "northern lights",
+    "city skyline night", "city skyline day", "neon street night",
+    "skyscraper building", "old town street", "village houses",
+    "countryside farm", "wheat field", "vineyard hills",
+    "horse running field", "horse grazing", "dog running", "dog playing park",
+    "cat sitting", "wild bird flying", "eagle flying", "owl perched",
+    "deer in forest", "fox in snow", "rabbit grass", "sheep grazing",
+    "cow pasture", "elephant savanna", "lion grass", "tiger jungle",
+    "fish underwater", "dolphin ocean", "sailboat lake", "sailing ship sea",
+    "fishing boat harbor", "rowboat river", "red car road", "vintage car",
+    "sports car street", "bicycle path", "train tracks", "airplane sky",
+    "hot air balloon", "lighthouse coast", "windmill field", "bridge river",
+    "castle hill", "church building", "barn farmhouse", "cabin in woods",
+    "tent campsite", "campfire night", "bonfire beach", "fireworks night",
+    "person walking beach", "person hiking mountain", "child playing park",
+    "people market street", "farmer field", "fisherman boat",
+    "cyclist road", "runner trail", "skier mountain", "surfer wave",
+    "tree alone field", "oak tree", "palm tree beach", "cherry blossom tree",
+    "flower garden", "sunflower field", "rose garden", "cactus desert",
+    "icebergs arctic", "glacier mountain", "volcano eruption", "canyon rock",
+    "cave entrance", "waterfall jungle", "lake reflection mountain",
+    "thunderstorm lightning", "rain street", "snow covered street",
+    "autumn leaves road", "spring blossoms park", "summer beach sunset",
+    "winter forest snow", "harbor boats sunset", "market stalls street",
+    "street food vendor", "night market lights", "desert camel",
+    "savanna sunset", "jungle river", "coral reef fish", "penguin ice",
+    "polar bear snow", "wolf forest", "owl night", "butterfly flower",
+]
+
+
+def api_get(params, retries=4):
+    params = dict(params)
+    params["format"] = "json"
+    url = API + "?" + urllib.parse.urlencode(params)
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return json.loads(resp.read())
+        except Exception as e:
+            if attempt == retries - 1:
+                print("  api_get failed:", e, file=sys.stderr)
+                return None
+            time.sleep(1.5 * (attempt + 1))
+
+
+def fetch_bytes(url, retries=3):
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return resp.read()
+        except Exception as e:
+            if attempt == retries - 1:
+                return None
+            time.sleep(1.0 * (attempt + 1))
+
+
+def clean_caption(title, desc):
+    t = title.replace("File:", "")
+    t = re.sub(r"\.(jpe?g|png|gif|tiff?|webp)$", "", t, flags=re.I)
+    t = t.replace("_", " ")
+    cap = desc.strip() if desc and len(desc.strip()) > 0 else t
+    cap = re.sub(r"<[^>]+>", " ", html.unescape(cap))   # strip any HTML
+    cap = re.sub(r"\s+", " ", cap).strip()
+    return cap[:200]
+
+
+BLOCK_WORDS = re.compile(
+    r"\b(montage|collage|composite|panorama|map|chart|diagram|painting|drawing|"
+    r"sketch|illustration|logo|flag|screenshot|graph|stamp|postcard|poster|"
+    r"by vincent van gogh|emblem|coat of arms|locator|infographic|panel of|"
+    r"set of \d|tiled|grid of|comparison)\b", re.I)
+
+
+def looks_like_photo(caption, categories):
+    text = (caption or "") + " " + (categories or "")
+    return not BLOCK_WORDS.search(text)
+
+
+def center_crop_square(img):
+    w, h = img.size
+    s = min(w, h)
+    left = (w - s) // 2
+    top = (h - s) // 2
+    return img.crop((left, top, left + s, top + s))
+
+
+def main():
+    resume = "--resume" in sys.argv
+    con = sqlite3.connect("dataset_real.db")
+    cur = con.cursor()
+    if resume:
+        cur.execute("PRAGMA journal_mode=DELETE")  # clear any stale -journal cleanly
+    else:
+        cur.executescript("DROP TABLE IF EXISTS samples;")
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS samples (
+            id            INTEGER PRIMARY KEY,
+            page_id       INTEGER UNIQUE,
+            query         TEXT,
+            title         TEXT,
+            caption       TEXT,
+            artist        TEXT,
+            license       TEXT,
+            source_url    TEXT,
+            width         INTEGER,
+            height        INTEGER,
+            image         BLOB
+        );
+        CREATE INDEX IF NOT EXISTS idx_query ON samples(query);
+    """)
+
+    done_queries = set()
+    seen_pageids = set()
+    if resume:
+        done_queries = {r[0] for r in cur.execute("SELECT DISTINCT query FROM samples")}
+        seen_pageids = {r[0] for r in cur.execute("SELECT page_id FROM samples")}
+        print(f"resuming: {len(done_queries)} queries already done, {len(seen_pageids)} rows so far")
+    total_saved = len(seen_pageids)
+    t0 = time.time()
+    for qi, q in enumerate(QUERIES):
+        if q in done_queries:
+            continue
+        data = api_get({
+            "action": "query", "generator": "search", "gsrsearch": q,
+            "gsrlimit": 40, "gsrnamespace": 6,
+            "prop": "imageinfo", "iiprop": "url|extmetadata|size",
+            "iiurlwidth": THUMB_W,
+        })
+        if not data or "query" not in data:
+            print(f"[{qi+1}/{len(QUERIES)}] {q!r}: no results")
+            continue
+        pages = list(data["query"]["pages"].values())
+        saved_here = 0
+        for p in pages:
+            pid = p.get("pageid")
+            if pid in seen_pageids:
+                continue
+            info = p.get("imageinfo")
+            if not info:
+                continue
+            info = info[0]
+            mime_ok = True
+            thumb_url = info.get("thumburl")
+            if not thumb_url or not re.search(r"\.(jpe?g|png)$", thumb_url, re.I):
+                continue
+            em = info.get("extmetadata", {})
+            license_short = em.get("LicenseShortName", {}).get("value", "unknown")
+            artist_raw = em.get("Artist", {}).get("value", "")
+            artist = re.sub(r"<[^>]+>", "", html.unescape(artist_raw)).strip()[:120]
+            desc = em.get("ImageDescription", {}).get("value", "") or em.get("ObjectName", {}).get("value", "")
+            caption = clean_caption(p.get("title", ""), desc)
+            categories = em.get("Categories", {}).get("value", "")
+            if len(caption) < 3 or not looks_like_photo(caption, categories):
+                continue
+            if info.get("width", 0) and info.get("height", 0):
+                ar = info["width"] / max(1, info["height"])
+                if ar > 3.2 or ar < 1 / 3.2:   # skip extreme panoramas/strips
+                    continue
+
+            raw = fetch_bytes(thumb_url)
+            if raw is None:
+                continue
+            try:
+                img = Image.open(io.BytesIO(raw)).convert("RGB")
+            except Exception:
+                continue
+            if min(img.size) < 16:
+                continue
+            img = center_crop_square(img).resize((OUT_SIZE, OUT_SIZE), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+
+            seen_pageids.add(pid)
+            cur.execute(
+                "INSERT OR IGNORE INTO samples (page_id,query,title,caption,artist,license,"
+                "source_url,width,height,image) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (pid, q, p.get("title", ""), caption, artist, license_short,
+                 info.get("descriptionurl", ""), OUT_SIZE, OUT_SIZE, buf.getvalue()))
+            saved_here += 1
+            total_saved += 1
+            time.sleep(0.05)
+        con.commit()
+        print(f"[{qi+1}/{len(QUERIES)}] {q!r}: +{saved_here} (total {total_saved})  ({time.time()-t0:.0f}s)")
+
+    print("done:", total_saved, "rows in", time.time() - t0, "s")
+    con.close()
+
+
+if __name__ == "__main__":
+    main()
