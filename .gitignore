@@ -3,3 +3,5 @@ __pycache__/
 model/train_db.log
 model/train.log
 model/train_real.log
+model/dataset_real.db-journal
+model/scrape_full.log

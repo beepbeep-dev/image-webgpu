@@ -60,13 +60,13 @@ freq = {}
 for toks in token_lists:
     for w in set(toks):
         freq[w] = freq.get(w, 0) + 1
-VOCAB_SIZE = 800
+VOCAB_SIZE = 1400
 vocab = [w for w, _ in sorted(freq.items(), key=lambda kv: -kv[1])[:VOCAB_SIZE]]
 word2id = {w: i for i, w in enumerate(vocab)}
 print("vocab size:", len(vocab), " e.g.:", vocab[:20])
 
-MAXLEN = 12
-EMBED_DIM = 48
+MAXLEN = 14
+EMBED_DIM = 64
 ids = np.zeros((N, MAXLEN), dtype=np.int64)
 mask = np.zeros((N, MAXLEN), dtype=np.float32)
 for i, toks in enumerate(token_lists):
@@ -108,17 +108,17 @@ class CaptionEncoder(nn.Module):
 
 
 device = "cpu"
-model = TinyUNet(c0=28, c1=44, c2=64, emb_dim=96, cdim=EMBED_DIM).to(device)
+model = TinyUNet(c0=36, c1=58, c2=84, emb_dim=128, cdim=EMBED_DIM).to(device)
 cap_enc = CaptionEncoder(len(vocab), EMBED_DIM).to(device)
 print("UNet params:", model.param_count(), " caption encoder params:",
       sum(p.numel() for p in cap_enc.parameters()))
 
 LR = 1e-3
-WARMUP = 200
+WARMUP = 300
 opt = torch.optim.Adam(list(model.parameters()) + list(cap_enc.parameters()), lr=LR)
 
-STEPS = 6000
-BATCH = 48
+STEPS = 12000
+BATCH = 64
 t0 = time.time()
 ema_loss = None
 for step in range(1, STEPS + 1):
@@ -166,7 +166,7 @@ b64 = base64.b64encode(flat.tobytes()).decode("ascii")
 
 meta = {
     "S": S, "T": T, "betaStart": BETA_START, "betaEnd": BETA_END,
-    "c0": 28, "c1": 44, "c2": 64, "embDim": 96, "cdim": EMBED_DIM,
+    "c0": 36, "c1": 58, "c2": 84, "embDim": 128, "cdim": EMBED_DIM,
     "vocab": vocab,
 }
 out = {"meta": meta, "order": order, "shapes": shapes, "b64": b64}

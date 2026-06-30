@@ -17,6 +17,7 @@ THUMB_W = 96
 OUT_SIZE = 32
 
 QUERIES = [
+    # --- nature / landscape (original set) ---
     "sunset sky", "sunrise sky", "starry night sky", "full moon night",
     "desert dunes", "snowy mountain", "mountain range", "green meadow field",
     "forest path", "pine forest", "autumn forest", "tropical beach",
@@ -48,6 +49,93 @@ QUERIES = [
     "street food vendor", "night market lights", "desert camel",
     "savanna sunset", "jungle river", "coral reef fish", "penguin ice",
     "polar bear snow", "wolf forest", "owl night", "butterfly flower",
+
+    # --- more animals ---
+    "elephant herd", "giraffe savanna", "zebra grassland", "kangaroo outback",
+    "panda eating bamboo", "monkey tree", "gorilla forest", "chimpanzee",
+    "shark underwater", "whale ocean", "octopus reef", "jellyfish sea",
+    "snake forest floor", "lizard rock", "frog pond", "turtle beach",
+    "hedgehog grass", "squirrel tree", "raccoon forest", "bear river",
+    "moose forest", "bison plains", "llama mountain", "alpaca farm",
+    "peacock feathers", "parrot tropical", "flamingo lake", "swan lake",
+    "duck pond", "goose flying", "chicken farm", "pig farm", "goat hill",
+    "donkey field", "camel desert caravan", "hippopotamus river",
+    "rhinoceros savanna", "crocodile river", "koala tree", "sloth tree",
+    "hawk flying", "falcon hunting", "crow perched", "robin bird garden",
+    "hummingbird flower", "seal beach rocks", "otter river", "beaver dam",
+    "ant macro", "bee flower", "ladybug leaf", "spider web", "dragonfly pond",
+    "snail leaf", "starfish beach", "crab beach", "lobster ocean",
+
+    # --- vehicles / transport ---
+    "truck highway", "motorcycle road", "helicopter sky", "rocket launch",
+    "submarine ocean", "tractor field", "scooter street", "city bus street",
+    "train station platform", "subway train", "ferry boat", "cruise ship sea",
+    "tram city street", "ambulance street", "fire truck", "police car",
+    "race car track", "monster truck", "go kart track", "snowmobile snow",
+    "kayak river", "canoe lake", "jet ski water", "cable car mountain",
+    "hot air balloons festival", "glider sky", "biplane vintage",
+    "freight train", "yacht harbor", "tugboat harbor",
+
+    # --- food / drink ---
+    "pizza table", "burger plate", "cake birthday", "coffee cup",
+    "fresh bread bakery", "fruit basket", "vegetables market",
+    "ice cream cone", "sushi plate", "pasta dish", "salad bowl",
+    "pancakes breakfast", "tacos plate", "soup bowl", "chocolate bar",
+    "wine glass", "tea cup", "fresh vegetables farm", "apple orchard",
+    "orange grove", "grapes vineyard", "strawberries basket", "watermelon slice",
+    "barbecue grill", "street food stall", "farmers market produce",
+
+    # --- architecture / places ---
+    "pyramid desert", "ancient temple", "mosque architecture",
+    "cathedral interior", "stadium crowd", "public library building",
+    "museum building", "stone tower", "dam river", "skyscraper street",
+    "amphitheater ancient", "palace garden", "windmill countryside",
+    "monastery mountain", "fortress wall", "harbor town", "fishing village",
+    "ski resort mountain", "vineyard estate", "rice terraces farm",
+    "greenhouse plants", "subway station", "rooftop city view",
+    "street market night", "alleyway old town", "town square fountain",
+
+    # --- sports / activities ---
+    "soccer match field", "basketball court game", "tennis court match",
+    "swimming pool race", "rock climbing cliff", "yoga outdoors",
+    "dancing stage performance", "painting artist studio", "cooking kitchen",
+    "reading book park", "camping tent mountain", "fishing lake shore",
+    "golf course green", "baseball field game", "volleyball beach",
+    "skateboarding park", "snowboarding mountain", "surfing big wave",
+    "rowing team river", "marathon runners street", "gymnastics performance",
+    "boxing match ring", "archery target", "horseback riding trail",
+
+    # --- everyday scenes / interiors ---
+    "kitchen interior modern", "bedroom interior cozy", "office workspace desk",
+    "classroom students", "science laboratory", "factory machinery",
+    "library bookshelves", "art gallery paintings", "concert stage crowd",
+    "bakery shop interior", "flower shop interior", "bookstore shelves",
+    "workshop tools", "garden greenhouse", "balcony plants city",
+
+    # --- textures / phenomena ---
+    "fire flames closeup", "water splash macro", "smoke abstract",
+    "ice crystals macro", "lava flow volcano", "crystal mineral",
+    "tornado storm", "hailstorm clouds", "sandstorm desert",
+    "lightning storm night", "aurora borealis sky", "fog mountain valley",
+    "frost window pattern", "bubbles water macro", "steam rising",
+
+    # --- space ---
+    "galaxy stars space", "planet space telescope", "astronaut spacewalk",
+    "satellite orbit earth", "space shuttle launch", "milky way night sky",
+    "solar eclipse sky", "comet night sky",
+
+    # --- musical instruments / tech / misc objects ---
+    "acoustic guitar closeup", "grand piano concert", "violin closeup",
+    "drum set stage", "trumpet musician", "robot machine",
+    "vintage computer", "smartphone closeup", "drone flying sky",
+    "camera photography closeup", "telescope observatory", "windsurfing sea",
+    "umbrella rain street", "lantern night street", "candle flame closeup",
+
+    # --- plants ---
+    "mushroom forest floor", "fern forest green", "bamboo forest path",
+    "lotus flower pond", "tulip field colorful", "orchid flower closeup",
+    "cactus garden desert", "moss covered rock", "ivy covered wall",
+    "wildflower meadow", "pine cone closeup", "autumn pumpkin patch",
 ]
 
 
@@ -79,13 +167,21 @@ def fetch_bytes(url, retries=3):
             time.sleep(1.0 * (attempt + 1))
 
 
+PLACEHOLDER_DESCS = {"see title", "see filename", "no description", "untitled", ""}
+
+
 def clean_caption(title, desc):
     t = title.replace("File:", "")
     t = re.sub(r"\.(jpe?g|png|gif|tiff?|webp)$", "", t, flags=re.I)
     t = t.replace("_", " ")
-    cap = desc.strip() if desc and len(desc.strip()) > 0 else t
+    cap = desc.strip() if desc and len(desc.strip()) > 0 else ""
     cap = re.sub(r"<[^>]+>", " ", html.unescape(cap))   # strip any HTML
-    cap = re.sub(r"\s+", " ", cap).strip()
+    # Wikidata structured-data leakage, e.g. `label QS:Len,"Sunset"` or
+    # `title QS:P1476,en:"..."` — cut everything from the first QS: marker on.
+    cap = re.sub(r"\b(label|title|description)\s+QS:.*$", "", cap, flags=re.I)
+    cap = re.sub(r"\s+", " ", cap).strip().strip('"').strip()
+    if cap.lower() in PLACEHOLDER_DESCS or len(cap) < 3:
+        cap = t   # fall back to the (cleaned) filename, which is usually descriptive
     return cap[:200]
 
 
