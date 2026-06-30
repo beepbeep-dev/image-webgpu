@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 model/train_db.log
 model/train.log
+model/train_real.log
