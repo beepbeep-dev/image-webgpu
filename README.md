@@ -82,11 +82,56 @@ from scratch** specifically to fit this 3 GB / iPad-9 target.
   domain-warped fractal (fBm) fields colored by a keyword palette, reproducible by
   seed. A few MB of RAM, instant, runs essentially anywhere.
 
-### C. 🧠 Diffusion (ONNX Runtime Web) — optional, experimental
+### C. 🧠 Diffusion (ONNX Runtime Web) — optional, a real pretrained model
 - **ONNX Runtime Web** (WebGPU EP, WASM fallback), lazy-loaded only when selected.
-  Runs a **real text-to-image ONNX model that you supply locally** (files stay in
-  your browser). A **hard memory-budget guard refuses models too big for the
-  device** and falls back to the neural model, so it never crashes a low-RAM tab.
+- **"Load recommended model"** pre-wires a genuine, publicly hosted pretrained
+  text-to-image model — **[SD-Turbo](https://huggingface.co/schmuell/sd-turbo-ort-web)**
+  (Stability AI's distilled, 1–4-step Stable Diffusion, ONNX export) — so you
+  don't have to hunt down and manually wire model files yourself. One button
+  click downloads it (~2.5 GB, cached by the browser after) and runs a **real
+  pipeline I implemented**: a CLIP BPE tokenizer (verified token-for-token
+  against the actual Python `transformers.CLIPTokenizer` on this model's
+  vocab/merges), the real `text_encoder` ONNX session, a real Euler-discrete
+  scheduler loop (matching `scheduler_config.json`: scaled-linear betas,
+  epsilon prediction, trailing timestep spacing) driving the real `unet`
+  session, and the real `vae_decoder` session to produce final pixels. No
+  classifier-free guidance is needed (SD-Turbo uses `guidance_scale=0`), so
+  each step is a single UNet forward pass.
+- **License:** SD-Turbo is distributed by Stability AI under a
+  [non-commercial research license](https://huggingface.co/stabilityai/sd-turbo/blob/main/LICENSE.TXT) —
+  personal/research use only. This is disclosed in the app's UI next to the
+  load button.
+- You can still **bring your own ONNX model file(s)** instead via "Advanced"
+  in the Diffusion setup panel; that path runs a best-effort generic forward
+  pass (not the full SD-Turbo pipeline above, since tokenizer/scheduler
+  specifics are model-dependent).
+- A **hard memory-budget guard refuses models too big for the device** —
+  checked against the *known* file sizes before a single byte is downloaded —
+  and falls back to the neural model, so it never crashes a low-RAM tab.
+- **Requires real WebGPU**, not just WASM. I downloaded and statically
+  inspected the actual `.onnx` graphs while building this (to get exact
+  input/output names, shapes, and dtypes right — e.g. `text_encoder`'s
+  `input_ids` is `int32` not the more common `int64`, and the UNet's
+  `timestep` input is rank-1 `[steps]`, not a scalar) and confirmed this
+  export's graph contains fused/precision-cast ops (`SimplifiedLayerNormFusion`
+  + float16 casts) that only ONNX Runtime Web's WebGPU kernels implement —
+  it fails to even *initialize* on a plain CPU/WASM execution provider. So
+  the app gates this engine on `caps.webgpu` specifically and refuses (with a
+  clear message, falling back to the neural model) rather than attempting a
+  WASM run that would fail with a cryptic type-mismatch error.
+- **Honest limitation on testing:** I verified, against the real model files
+  (not assumptions): the tokenizer is byte-for-byte identical to Python's
+  `transformers.CLIPTokenizer` on this model's actual vocab/merges (including
+  the quirk that `"!"` is a directly-mapped added token sharing id 0 with the
+  pad token); the scheduler's `timesteps`/`sigmas` match the published
+  `scheduler_config.json` math (e.g. the 1-step schedule resolves to `t=999`
+  and the 4-step schedule to `[999, 749, 499, 249]`, matching SD-Turbo's known
+  published schedule); and every input/output name, shape and dtype my code
+  uses was read directly from the downloaded graphs, not guessed. This
+  sandboxed environment has no GPU/WebGPU hardware, so I could not execute the
+  actual UNet/text-encoder forward passes here (they require WebGPU, see
+  above) — final image *quality* is unverified end-to-end. If you hit an
+  issue, please file it with the prompt/device used.
 
 ### Will it run on an iPad 9?
 **Yes — the default Neural model and the Procedural engine both do, reliably, at
