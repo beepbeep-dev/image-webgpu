@@ -2,19 +2,20 @@
 Train PocketPaint's own tiny generative model.
 
 The model is a CONDITIONAL NEURAL FIELD (a small MLP / CPPN):
-    input  = [ Fourier(x,y) , x, y, r , condition_vector(12) ]   (39 dims)
+    input  = [ Fourier(x,y) , x, y, r , condition_vector(17) ]   (44 dims)
     output = RGB at that pixel                                    (3 dims)
 
 It is trained by DISTILLING a hand-written analytic "scene renderer" R(x,y,c):
 the renderer composes recognizable landscapes (sky by time-of-day, ground by
-biome, optional mountains / neon / fire) from a 12-D semantic condition vector.
-Because R is smooth and deterministic, a small MLP can learn to reproduce it and
-then generalize/interpolate across conditions — giving us a real, trained neural
-generator that is only ~20k params, renders at any resolution, and runs in the
-browser (WebGPU shader or JS) with zero downloads.
+biome, optional mountains / neon / fire) AND simple silhouette SUBJECTS
+(person / horse / tree / building, placed on the ground) from a 17-D semantic
+condition vector. Because R is smooth and deterministic, a small MLP can learn
+to reproduce it and then generalize/interpolate across conditions — giving us
+a real, trained neural generator that is only ~30k params, renders at any
+resolution, and runs in the browser (plain JS) with zero downloads.
 
-Outputs: model.json (weights, float16-ish) consumed by the web app, plus a few
-preview PNGs so we can eyeball quality before shipping.
+Outputs: model.json (weights) consumed by the web app, plus a few preview
+PNGs so we can eyeball quality before shipping.
 """
 import numpy as np, json, struct, zlib, math, time
 
@@ -26,21 +27,82 @@ rng = np.random.default_rng(0)
 #  0 night     1 sunset    2 day       3 overcast      (sky / time-of-day)
 #  4 ocean     5 forest    6 desert    7 snow      8 plain   (ground biome)
 #  9 mountains 10 neon     11 fire
+#  12 person   13 horse    14 tree     15 building        (subjects, on ground)
+#  16 subj_x   (0..1, horizontal placement of the subject group, default 0.5)
 # ----------------------------------------------------------------------------
-CDIM = 12
+CDIM = 17
 HORIZON = 0.58
 
 def _mix(a, b, t):
     return a + (b - a) * t
 
+# ----------------------------------------------------------------------------
+# Soft shape primitives for subject silhouettes (smooth, learnable edges).
+# ----------------------------------------------------------------------------
+def soft_rect(u, v, hw, hh, edge=0.045):
+    du = np.clip((np.abs(u) - hw) / edge, 0, 1)
+    dv = np.clip((np.abs(v) - hh) / edge, 0, 1)
+    return np.clip((1 - du) * (1 - dv), 0, 1)
+
+def soft_circle(u, v, r, edge=0.045):
+    d = np.sqrt(u * u + v * v) - r
+    return np.clip(1 - d / edge, 0, 1)
+
+def soft_ellipse(u, v, ru, rv, edge=0.10):
+    d = (u / ru) ** 2 + (v / rv) ** 2 - 1
+    return np.clip(1 - d / edge, 0, 1)
+
+def person_mask(u, v):
+    """u,v local coords centered at feet (v=0 feet .. v=1 head), unit height."""
+    leg1 = soft_rect(u + 0.09, v - 0.20, 0.045, 0.20)
+    leg2 = soft_rect(u - 0.09, v - 0.20, 0.045, 0.20)
+    body = soft_rect(u, v - 0.58, 0.16, 0.18)
+    arm1 = soft_rect(u + 0.22, v - 0.55, 0.045, 0.16)
+    arm2 = soft_rect(u - 0.22, v - 0.55, 0.045, 0.16)
+    head = soft_circle(u, v - 0.88, 0.13)
+    return np.maximum.reduce([leg1, leg2, body, arm1, arm2, head])
+
+def horse_mask(u, v):
+    legs = np.maximum.reduce([
+        soft_rect(u + 0.30, v - 0.16, 0.035, 0.16),
+        soft_rect(u + 0.14, v - 0.16, 0.035, 0.16),
+        soft_rect(u - 0.14, v - 0.16, 0.035, 0.16),
+        soft_rect(u - 0.30, v - 0.16, 0.035, 0.16),
+    ])
+    body = soft_ellipse(u, v - 0.48, 0.36, 0.18)
+    neck = soft_ellipse(u - 0.40, v - 0.66, 0.13, 0.20)
+    head = soft_ellipse(u - 0.52, v - 0.84, 0.10, 0.13)
+    return np.maximum.reduce([legs, body, neck, head])
+
+def tree_mask(u, v):
+    trunk = soft_rect(u, v - 0.18, 0.045, 0.18)
+    canopy = soft_circle(u, v - 0.62, 0.30)
+    canopy2 = soft_circle(u - 0.16, v - 0.50, 0.20)
+    canopy3 = soft_circle(u + 0.16, v - 0.50, 0.20)
+    return np.maximum.reduce([trunk, canopy, canopy2, canopy3]), trunk, np.maximum(canopy, np.maximum(canopy2, canopy3))
+
+def building_mask(u, v):
+    body = soft_rect(u, v - 0.40, 0.30, 0.40)
+    roof = soft_rect(u, v - 0.82, 0.34, 0.06)
+    return np.maximum(body, roof)
+
+def place(x, y, cx, scale):
+    """Local coords for a subject standing at (cx, ground) with given scale."""
+    baseline = HORIZON + 0.018
+    u = (x - cx) / scale
+    v = (baseline - y) / scale
+    return u, v
+
 def render(x, y, c):
     """Analytic ground-truth scene renderer, fully vectorized.
-    x,y: arrays in [0,1] (y=0 top). c: array [...,12]. Returns [...,3] in [0,1]."""
+    x,y: arrays in [0,1] (y=0 top). c: array [...,17]. Returns [...,3] in [0,1]."""
     x = np.asarray(x); y = np.asarray(y)
     c = np.asarray(c)
     night = c[..., 0]; sunset = c[..., 1]; day = c[..., 2]; over = c[..., 3]
     ocean = c[..., 4]; forest = c[..., 5]; desert = c[..., 6]; snow = c[..., 7]; plain = c[..., 8]
     mount = c[..., 9]; neon = c[..., 10]; fire = c[..., 11]
+    person = c[..., 12]; horse = c[..., 13]; tree = c[..., 14]; building = c[..., 15]
+    subj_x = c[..., 16] * 0.5 + 0.25  # keep group roughly within frame [0.25,0.75]
 
     sky_w = night + sunset + day + over + 1e-3
     # vertical param within sky (0 top .. 1 horizon)
@@ -110,6 +172,33 @@ def render(x, y, c):
     neon_grade = np.clip(neon_grade + np.array([0.7, 0.1, 0.9]) * horizon_glow[..., None] * 0.5, 0, 1)
     col = _mix(col, neon_grade, (neon * 0.85)[..., None])
 
+    # ---- Subjects: simple silhouettes standing on the ground, drawn back to
+    # front (tree, building, horse, person) so they layer sensibly when more
+    # than one is requested at once. Each gets a small fixed offset from
+    # subj_x so a "person and a horse" don't perfectly overlap.
+    def paint(mask, color):
+        nonlocal col
+        col = col * (1 - mask[..., None]) + np.asarray(color, dtype=np.float64) * mask[..., None]
+
+    ux, vt = place(x, y, np.clip(subj_x - 0.20, 0.08, 0.92), 0.40)
+    tm, trunk_m, canopy_m = tree_mask(ux, vt)
+    tree_paint = (np.clip(trunk_m, 0, 1) * tree)[..., None] * np.array([0.30, 0.20, 0.10]) + \
+                 (np.clip(canopy_m, 0, 1) * tree)[..., None] * np.array([0.10, 0.30, 0.08])
+    tree_alpha = np.clip(tm * tree, 0, 1)
+    col = col * (1 - tree_alpha[..., None]) + tree_paint
+
+    ub, vb = place(x, y, np.clip(subj_x + 0.32, 0.08, 0.92), 0.50)
+    bm = building_mask(ub, vb)
+    paint(np.clip(bm * building, 0, 1), (0.32, 0.30, 0.34))
+
+    uh, vh = place(x, y, np.clip(subj_x + 0.05, 0.08, 0.92), 0.22)
+    hm = horse_mask(uh, vh)
+    paint(np.clip(hm * horse, 0, 1), (0.32, 0.20, 0.12))
+
+    up, vp = place(x, y, subj_x, 0.30)
+    pm = person_mask(up, vp)
+    paint(np.clip(pm * person, 0, 1), (0.10, 0.10, 0.14))
+
     return np.clip(col, 0, 1)
 
 # ----------------------------------------------------------------------------
@@ -136,6 +225,13 @@ def sample_conditions(n):
     c[:, 9] = (rng.random(n) < 0.35) * rng.uniform(0.4, 1.0, n)   # mountains
     c[:, 10] = (rng.random(n) < 0.18) * rng.uniform(0.5, 1.0, n)  # neon
     c[:, 11] = (rng.random(n) < 0.18) * rng.uniform(0.4, 1.0, n)  # fire
+    # subjects: each independently has a chance to appear; bias toward at
+    # least one subject often so the net sees plenty of foreground examples.
+    c[:, 12] = (rng.random(n) < 0.30) * rng.uniform(0.7, 1.0, n)  # person
+    c[:, 13] = (rng.random(n) < 0.25) * rng.uniform(0.7, 1.0, n)  # horse
+    c[:, 14] = (rng.random(n) < 0.30) * rng.uniform(0.7, 1.0, n)  # tree
+    c[:, 15] = (rng.random(n) < 0.20) * rng.uniform(0.7, 1.0, n)  # building
+    c[:, 16] = rng.uniform(0.0, 1.0, n)                            # subj_x
     # small noise + clamp
     c = np.clip(c + rng.normal(0, 0.03, c.shape), 0, 1)
     return c
@@ -152,7 +248,7 @@ def encode(x, y, c):
         f = (2.0 ** k) * math.pi
         feats += [np.sin(f * xp), np.cos(f * xp), np.sin(f * yp), np.cos(f * yp)]
     base = np.stack(feats, axis=-1)               # [...,3+4K]
-    return np.concatenate([base, c], axis=-1)     # [...,3+4K+12]
+    return np.concatenate([base, c], axis=-1)     # [...,3+4K+17]
 
 DIM = 3 + 4 * K + CDIM
 print("input dim DIM =", DIM)
@@ -160,7 +256,7 @@ print("input dim DIM =", DIM)
 # ----------------------------------------------------------------------------
 # Tiny MLP: DIM -> H -> H -> H -> 3 with tanh hidden, sigmoid output.
 # ----------------------------------------------------------------------------
-H = 96
+H = 112
 def glorot(a, b):
     return rng.normal(0, math.sqrt(2.0 / (a + b)), (a, b))
 P = {
@@ -193,14 +289,14 @@ def adam(grads, t, lr=2e-3, b1=0.9, b2=0.999, eps=1e-8):
 # ----------------------------------------------------------------------------
 # Training loop: fresh analytic data each step (infinite dataset).
 # ----------------------------------------------------------------------------
-STEPS = 6000
+STEPS = 9000
 NC = 96            # conditions per batch
-NP = 160           # pixels per condition  -> batch = 15360
+NP = 192           # pixels per condition  -> batch = 18432
 t0 = time.time()
 for step in range(1, STEPS + 1):
-    c = sample_conditions(NC)                              # [NC,12]
+    c = sample_conditions(NC)                              # [NC,17]
     px = rng.random((NC, NP)); py = rng.random((NC, NP))   # pixel coords
-    cc = np.repeat(c[:, None, :], NP, axis=1)              # [NC,NP,12]
+    cc = np.repeat(c[:, None, :], NP, axis=1)              # [NC,NP,17]
     X = encode(px, py, cc).reshape(-1, DIM)
     Y = render(px, py, cc).reshape(-1, 3)
 
@@ -261,18 +357,23 @@ def net_render(c, S=128):
 def C(**kw):
     c = np.zeros(CDIM)
     idx = {"night":0,"sunset":1,"day":2,"overcast":3,"ocean":4,"forest":5,
-           "desert":6,"snow":7,"plain":8,"mountains":9,"neon":10,"fire":11}
+           "desert":6,"snow":7,"plain":8,"mountains":9,"neon":10,"fire":11,
+           "person":12,"horse":13,"tree":14,"building":15,"subj_x":16}
     for k, val in kw.items():
         c[idx[k]] = val
+    if "subj_x" not in kw:
+        c[16] = 0.5
     return c
 
 previews = {
     "sunset_ocean":  C(sunset=1, ocean=1),
     "night_mountain":C(night=1, mountains=1, plain=1),
-    "day_forest":    C(day=1, forest=1),
+    "day_forest":    C(day=1, forest=1, tree=1),
     "desert_day":    C(day=1, desert=1),
-    "neon_city":     C(night=1, neon=1, plain=1),
-    "snow_mountain": C(day=1, snow=1, mountains=1),
+    "person_plain":  C(day=1, plain=1, person=1),
+    "horse_pasture": C(day=1, plain=1, horse=1),
+    "village_day":   C(day=1, plain=1, building=1, tree=0.6),
+    "person_horse_sunset": C(sunset=1, plain=1, person=1, horse=1, subj_x=0.4),
 }
 for name, c in previews.items():
     write_png(f"preview_{name}.png", net_render(c, 160))
