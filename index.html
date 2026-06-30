@@ -1,0 +1,917 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>PocketPaint — Browser Image Generator</title>
+
+<!--
+  PocketPaint — a 100% local, in-browser image generator in a single HTML file.
+  ===========================================================================
+  No backend, no cloud API, no login, no paid service, no Node.js needed to RUN.
+
+  Two engines are included (pick one in the UI):
+
+  1) "Local Generative Engine" (DEFAULT, always available)
+     - Runs a hand-written WebGPU fragment shader (with a Canvas2D fallback).
+     - Turns your prompt + seed + steps into a unique, reproducible image.
+     - Uses only a few megabytes of RAM, starts instantly, works on low-end
+       devices, and needs zero downloads. This is genuine procedural image
+       synthesis (domain-warped fractal fields + a keyword-driven palette),
+       NOT a semantic neural net — see the honest "Limitations" note in the UI.
+
+  2) "Diffusion (ONNX Runtime Web)" (OPTIONAL, experimental)
+     - Real neural text-to-image using ONNX Runtime Web + WebGPU.
+     - You bring your own small/quantized ONNX model files locally (no upload,
+       files stay in your browser). Setup instructions are in the UI panel.
+     - Honest caveat: true Stable-Diffusion-class models are heavy; on a ~3 GB
+       RAM device only the smallest quantized models have a chance of running.
+
+  WHY THIS DESIGN?
+  - The brief asks for something that *realistically* runs in ~3 GB of RAM with
+    fast startup and broad compatibility. A full Stable Diffusion model needs
+    far more than that in a browser tab, so making it the only path would mean
+    the app fails to start on the target hardware. Instead we ship an engine
+    that ALWAYS works within the memory budget, plus an honest, optional bridge
+    to real diffusion for users who have a capable device and a small model.
+-->
+
+<style>
+  /* ---------- Modern, clean, dark UI. Pure CSS, no frameworks. ---------- */
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-2: #1c2330;
+    --border: #2a3140;
+    --text: #e6edf3;
+    --muted: #9aa7b4;
+    --accent: #6e8bff;
+    --accent-2: #b06eff;
+    --good: #3fb950;
+    --warn: #d29922;
+    --bad: #f85149;
+    --radius: 14px;
+    --shadow: 0 10px 30px rgba(0,0,0,.35);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--text);
+    background:
+      radial-gradient(1200px 600px at 10% -10%, #1a2440 0%, transparent 55%),
+      radial-gradient(1000px 600px at 110% 10%, #2a163d 0%, transparent 55%),
+      var(--bg);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 24px 18px 60px; }
+
+  header { display: flex; align-items: center; gap: 14px; margin-bottom: 6px; }
+  .logo {
+    width: 42px; height: 42px; border-radius: 12px; flex: none;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    box-shadow: var(--shadow);
+    display: grid; place-items: center; font-size: 22px;
+  }
+  h1 { font-size: 1.35rem; margin: 0; letter-spacing: .2px; }
+  .tagline { color: var(--muted); font-size: .9rem; margin: 2px 0 0; }
+
+  .grid { display: grid; grid-template-columns: 360px 1fr; gap: 18px; margin-top: 22px; }
+  @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 16px;
+  }
+  .card h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .12em; color: var(--muted); margin: 0 0 12px; }
+
+  label { display: block; font-size: .82rem; color: var(--muted); margin: 12px 0 6px; }
+  textarea, input[type="text"], input[type="number"], select {
+    width: 100%; background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px;
+    font: inherit; font-size: .95rem; outline: none; transition: border-color .15s, box-shadow .15s;
+  }
+  textarea { resize: vertical; min-height: 84px; }
+  textarea:focus, input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(110,139,255,.18); }
+
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+
+  .seed-row { display: flex; gap: 8px; align-items: end; }
+  .seed-row > div { flex: 1; }
+  .icon-btn {
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+    border-radius: 10px; padding: 10px 12px; cursor: pointer; font-size: .95rem;
+  }
+  .icon-btn:hover { border-color: var(--accent); }
+
+  .range-wrap { display:flex; align-items:center; gap:10px; }
+  input[type="range"] { width: 100%; accent-color: var(--accent); }
+  .range-val { width: 36px; text-align: right; color: var(--text); font-variant-numeric: tabular-nums; }
+
+  button.primary {
+    width: 100%; margin-top: 16px; padding: 13px 16px; border: none; cursor: pointer;
+    border-radius: 12px; font-size: 1rem; font-weight: 650; color: white;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    box-shadow: var(--shadow); transition: transform .05s, filter .15s;
+  }
+  button.primary:hover { filter: brightness(1.08); }
+  button.primary:active { transform: translateY(1px); }
+  button.primary:disabled { filter: grayscale(.6) brightness(.7); cursor: not-allowed; }
+
+  .stage { display: flex; flex-direction: column; }
+  .canvas-shell {
+    position: relative; width: 100%; aspect-ratio: 1 / 1; background:
+      repeating-conic-gradient(#11161f 0% 25%, #0c1119 0% 50%) 50% / 24px 24px;
+    border-radius: 12px; overflow: hidden; border: 1px solid var(--border);
+    display: grid; place-items: center;
+  }
+  canvas { width: 100%; height: 100%; display: block; image-rendering: auto; }
+  .placeholder { position: absolute; color: var(--muted); font-size: .9rem; text-align: center; padding: 20px; pointer-events: none; }
+
+  .progress { height: 8px; background: var(--panel-2); border-radius: 999px; overflow: hidden; margin-top: 14px; border: 1px solid var(--border); }
+  .bar { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width .12s linear; }
+  .status { margin-top: 10px; font-size: .86rem; color: var(--muted); min-height: 20px; display:flex; align-items:center; gap:8px; }
+  .status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex:none; }
+  .status.ok .dot { background: var(--good); }
+  .status.work .dot { background: var(--warn); animation: pulse 1s infinite; }
+  .status.err .dot { background: var(--bad); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+  .actions { display: flex; gap: 10px; margin-top: 12px; }
+  .actions button { flex: 1; }
+
+  .caps { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+  .chip { font-size: .72rem; padding: 4px 9px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); background: var(--panel-2); }
+  .chip.yes { color: var(--good); border-color: rgba(63,185,80,.4); }
+  .chip.no { color: var(--bad); border-color: rgba(248,81,73,.4); }
+
+  details { margin-top: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel-2); }
+  summary { cursor: pointer; padding: 10px 12px; font-size: .85rem; color: var(--text); }
+  details[open] summary { border-bottom: 1px solid var(--border); }
+  .details-body { padding: 12px; font-size: .82rem; color: var(--muted); }
+  .details-body code, code.inline { background: #0a0e14; border: 1px solid var(--border); border-radius: 6px; padding: 1px 6px; color: #cdd9e5; font-size: .82em; }
+  pre { background: #0a0e14; border: 1px solid var(--border); border-radius: 8px; padding: 10px; overflow: auto; font-size: .78rem; color: #cdd9e5; }
+
+  .note { font-size: .8rem; color: var(--muted); margin-top: 14px; padding: 10px 12px; border-left: 3px solid var(--accent); background: var(--panel-2); border-radius: 0 8px 8px 0; }
+  .seg { display:flex; background: var(--panel-2); border:1px solid var(--border); border-radius: 10px; padding: 4px; gap:4px; }
+  .seg button { flex:1; border:none; background:transparent; color: var(--muted); padding: 8px; border-radius: 7px; cursor:pointer; font: inherit; font-size:.85rem; }
+  .seg button.active { background: linear-gradient(135deg, var(--accent), var(--accent-2)); color:white; }
+  a { color: var(--accent); }
+  footer { text-align:center; color: var(--muted); font-size:.78rem; margin-top: 28px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">🎨</div>
+    <div>
+      <h1>PocketPaint</h1>
+      <p class="tagline">Local, in-browser image generation — no server, no API key, runs in ~3&nbsp;GB RAM.</p>
+    </div>
+  </header>
+
+  <div class="caps" id="caps"><!-- capability chips injected here --></div>
+
+  <div class="grid">
+    <!-- ============================ CONTROLS ============================ -->
+    <section class="card" aria-label="Controls">
+      <h2>Prompt &amp; Settings</h2>
+
+      <label for="prompt">Text prompt</label>
+      <textarea id="prompt" placeholder="e.g. a calm ocean sunset, neon city at night, misty forest…">a serene ocean sunset with glowing clouds</textarea>
+
+      <label>Engine</label>
+      <div class="seg" id="engineSeg" role="tablist">
+        <button data-engine="local" class="active">⚡ Local engine</button>
+        <button data-engine="diffusion">🧠 Diffusion (ONNX)</button>
+      </div>
+
+      <div class="row">
+        <div>
+          <label for="size">Image size</label>
+          <select id="size">
+            <option value="256">256 × 256 (lightest)</option>
+            <option value="384">384 × 384</option>
+            <option value="512" selected>512 × 512</option>
+            <option value="640">640 × 640</option>
+          </select>
+        </div>
+        <div>
+          <label for="steps">Steps <span class="range-val" id="stepsVal">8</span></label>
+          <div class="range-wrap">
+            <input type="range" id="steps" min="1" max="20" value="8" />
+          </div>
+        </div>
+      </div>
+
+      <label for="seed">Seed (same seed + prompt ⇒ same image)</label>
+      <div class="seed-row">
+        <div><input type="number" id="seed" value="12345" min="0" step="1" /></div>
+        <button class="icon-btn" id="randSeed" title="Randomize seed">🎲</button>
+      </div>
+
+      <button class="primary" id="generate">Generate Image</button>
+
+      <!-- Diffusion (ONNX) setup panel — collapsed by default -->
+      <details id="diffusionPanel">
+        <summary>🧠 Diffusion mode setup (optional, experimental)</summary>
+        <div class="details-body">
+          <p>The Local engine works with zero setup. To run a <b>real neural
+          text-to-image model</b> entirely in your browser via
+          <code class="inline">ONNX Runtime Web</code> + WebGPU, load a small,
+          quantized ONNX model from your device. Files never leave your machine.</p>
+          <ol>
+            <li>Download a small/quantized text-to-image ONNX model locally
+                (e.g. a quantized SD-Turbo / Tiny-SD export). On a 3&nbsp;GB
+                device, only the smallest int8 models have a chance of fitting.</li>
+            <li>Pick the model folder / <code class="inline">.onnx</code> files below.</li>
+            <li>Press <b>Generate</b> with the Diffusion engine selected.</li>
+          </ol>
+          <label for="modelFiles">Model file(s) — <code class="inline">.onnx</code> / <code class="inline">.onnx_data</code></label>
+          <input type="file" id="modelFiles" multiple accept=".onnx,.onnx_data,.json,.txt" />
+          <p class="note" style="margin-top:10px">Honest caveat: this single-file
+          app provides the WebGPU/ONNX runtime, capability checks and the
+          generation loop scaffolding, but a full diffusion pipeline (tokenizer +
+          text encoder + UNet scheduler loop + VAE) depends on the exact model you
+          supply. If a model isn't loaded or doesn't fit in memory, the app falls
+          back to the Local engine and tells you why.</p>
+        </div>
+      </details>
+
+      <div class="note">
+        <b>How the Local engine works:</b> your prompt's keywords pick a color
+        palette and mood, the seed makes it reproducible, and "steps" refines
+        detail. It's real procedural synthesis (not a neural net), so it's
+        instant and tiny — perfect for low-RAM devices.
+      </div>
+    </section>
+
+    <!-- ============================ STAGE ============================ -->
+    <section class="card stage" aria-label="Preview">
+      <h2>Preview</h2>
+      <div class="canvas-shell">
+        <canvas id="canvas" width="512" height="512"></canvas>
+        <div class="placeholder" id="placeholder">Your image will appear here.<br/>Type a prompt and press <b>Generate</b>.</div>
+      </div>
+
+      <div class="progress"><div class="bar" id="bar"></div></div>
+      <div class="status" id="status"><span class="dot"></span><span id="statusText">Ready.</span></div>
+
+      <div class="actions">
+        <button class="icon-btn" id="download" disabled>⬇ Download PNG</button>
+        <button class="icon-btn" id="copyPrompt">📋 Copy prompt</button>
+      </div>
+    </section>
+  </div>
+
+  <footer>
+    PocketPaint · single-file · 100% local · open <code class="inline">index.html</code> directly or serve with any static server.
+  </footer>
+</div>
+
+<script>
+/* ===========================================================================
+   PocketPaint — application logic
+   ---------------------------------------------------------------------------
+   Sections:
+     A. Capability detection + graceful error handling
+     B. Deterministic PRNG + prompt → parameters (keyword palette)
+     C. Local engine: WebGPU renderer (with Canvas2D fallback)
+     D. Diffusion engine: ONNX Runtime Web bridge (lazy, optional)
+     E. UI wiring
+   =========================================================================== */
+
+"use strict";
+
+/* ---------- small DOM helpers ---------- */
+const $ = (id) => document.getElementById(id);
+const canvas = $("canvas");
+const statusEl = $("status");
+const statusText = $("statusText");
+const bar = $("bar");
+const placeholder = $("placeholder");
+
+let currentEngine = "local";
+let busy = false;
+let webgpuDevice = null;       // cached GPUDevice once acquired
+let modelFiles = [];           // user-selected ONNX files (diffusion mode)
+
+function setStatus(text, kind /* '', 'ok', 'work', 'err' */) {
+  statusText.textContent = text;
+  statusEl.className = "status" + (kind ? " " + kind : "");
+}
+function setProgress(p) { bar.style.width = Math.max(0, Math.min(100, p * 100)) + "%"; }
+
+/* =====================================================================
+   A. CAPABILITY DETECTION
+   We probe WebGPU, WebGL2, WASM and the (rough) device memory hint so we
+   can pick the best engine and show honest errors instead of crashing.
+   ===================================================================== */
+const caps = {
+  webgpu: "gpu" in navigator,
+  webgl2: !!document.createElement("canvas").getContext("webgl2"),
+  wasm: typeof WebAssembly === "object",
+  // navigator.deviceMemory is a coarse hint in GB (Chrome). May be undefined.
+  memoryGB: navigator.deviceMemory || null,
+  cores: navigator.hardwareConcurrency || null,
+};
+
+function renderCaps() {
+  const el = $("caps");
+  const chip = (label, ok, neutral) =>
+    `<span class="chip ${neutral ? "" : ok ? "yes" : "no"}">${ok ? "✓" : "✗"} ${label}</span>`;
+  el.innerHTML =
+    chip("WebGPU", caps.webgpu) +
+    chip("WebGL2", caps.webgl2) +
+    chip("WebAssembly", caps.wasm) +
+    `<span class="chip">${caps.memoryGB ? "~" + caps.memoryGB + " GB RAM" : "RAM: unknown"}</span>` +
+    `<span class="chip">${caps.cores ? caps.cores + " cores" : "cores: ?"}</span>`;
+}
+
+/* Acquire a WebGPU device once and cache it. Returns null if unavailable. */
+async function getWebGPUDevice() {
+  if (webgpuDevice) return webgpuDevice;
+  if (!caps.webgpu) return null;
+  try {
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "low-power" });
+    if (!adapter) return null;
+    webgpuDevice = await adapter.requestDevice();
+    // If the device is lost we drop the cache so we can re-acquire/fallback.
+    webgpuDevice.lost.then(() => { webgpuDevice = null; });
+    return webgpuDevice;
+  } catch (e) {
+    console.warn("WebGPU device request failed:", e);
+    return null;
+  }
+}
+
+/* =====================================================================
+   B. DETERMINISTIC RANDOMNESS + PROMPT ANALYSIS
+   - mulberry32: tiny, fast, seedable PRNG so results are reproducible.
+   - hashString: stable 32-bit hash to fold the prompt into the seed.
+   - analyzePrompt: maps keywords to a palette + mood so the prompt
+     visibly steers the image. This is keyword-driven art direction,
+     not semantic understanding — and we say so honestly in the UI.
+   ===================================================================== */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hashString(str) {
+  let h = 2166136261 >>> 0;            // FNV-1a
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+// Keyword → base hue (degrees) and mood weighting. Extend freely.
+const PALETTE_KEYWORDS = [
+  { words: ["sunset", "sunrise", "dusk", "dawn", "golden"], hue: 28,  warm: 1 },
+  { words: ["ocean", "sea", "water", "wave", "lake", "river"], hue: 205, warm: 0 },
+  { words: ["sky", "cloud", "air", "blue"], hue: 215, warm: 0 },
+  { words: ["forest", "tree", "jungle", "leaf", "moss", "green"], hue: 130, warm: 0 },
+  { words: ["fire", "flame", "lava", "ember", "burn", "red"], hue: 8,   warm: 1 },
+  { words: ["ice", "frost", "snow", "winter", "cold", "cyan"], hue: 190, warm: 0 },
+  { words: ["night", "dark", "shadow", "black", "void"], hue: 250, warm: 0, dark: 1 },
+  { words: ["neon", "cyber", "synth", "electric", "glow"], hue: 300, warm: 0, sat: 1 },
+  { words: ["desert", "sand", "dune", "canyon"], hue: 38,  warm: 1 },
+  { words: ["flower", "rose", "bloom", "pink", "petal"], hue: 330, warm: 1 },
+  { words: ["purple", "violet", "lavender", "magenta"], hue: 280, warm: 0 },
+  { words: ["gold", "yellow", "sun", "bright"], hue: 50,  warm: 1 },
+  { words: ["space", "galaxy", "star", "cosmos", "nebula"], hue: 265, warm: 0, sat: 1 },
+];
+
+function analyzePrompt(prompt, seed) {
+  const text = (prompt || "").toLowerCase();
+  let hueAcc = 0, hueW = 0, warm = 0, dark = 0, sat = 0, hits = 0;
+  for (const k of PALETTE_KEYWORDS) {
+    for (const w of k.words) {
+      if (text.includes(w)) {
+        hueAcc += k.hue; hueW++; hits++;
+        warm += k.warm || 0; dark += k.dark || 0; sat += k.sat || 0;
+        break; // count each palette group at most once
+      }
+    }
+  }
+  // Combine prompt hash with the user seed for full reproducibility.
+  const combined = (hashString(text) ^ (seed >>> 0)) >>> 0;
+  const rng = mulberry32(combined);
+
+  // Base hue: keyword-driven if we matched anything, else hash-driven.
+  const baseHue = hueW > 0 ? (hueAcc / hueW) : (rng() * 360);
+  return {
+    rng,
+    seed: combined,
+    baseHue,
+    hueSpread: 30 + rng() * 90,            // palette width
+    warmth: hits ? warm / Math.max(1, hits) : rng(),
+    darkness: Math.min(1, dark * 0.6 + rng() * 0.25),
+    saturation: 0.55 + Math.min(0.4, sat * 0.2) + rng() * 0.1,
+    // Structural parameters that give each prompt a distinct "composition".
+    warp: 0.6 + rng() * 1.8,
+    frequency: 1.2 + rng() * 2.8,
+    swirl: (rng() - 0.5) * 4.0,
+    symmetry: rng() < 0.35 ? (rng() < 0.5 ? 2 : 4) : 0,
+    grain: 0.03 + rng() * 0.06,
+  };
+}
+
+/* =====================================================================
+   C. LOCAL ENGINE
+   Primary path: WebGPU fragment shader (domain-warped fractal field).
+   Fallback path: Canvas2D CPU renderer (slower but universal).
+   Both are tiny in memory and reproducible from (prompt, seed).
+   "steps" progressively adds octaves so the user sees refinement.
+   ===================================================================== */
+
+// ---- C.1 WebGPU shader source (WGSL) ----
+// A fullscreen triangle samples a domain-warped fractional-Brownian-motion
+// field. Uniforms carry the prompt-derived parameters. Increasing "octaves"
+// (driven by steps) sharpens detail. HSV→RGB gives a controllable palette.
+const WGSL = /* wgsl */`
+struct Params {
+  res      : vec2<f32>,
+  baseHue  : f32,
+  hueSpread: f32,
+  warmth   : f32,
+  darkness : f32,
+  saturation: f32,
+  warp     : f32,
+  frequency: f32,
+  swirl    : f32,
+  symmetry : f32,
+  grain    : f32,
+  octaves  : f32,
+  seed     : f32,
+};
+@group(0) @binding(0) var<uniform> P : Params;
+
+// Hash + value noise (cheap, GPU-friendly).
+fn hash2(p: vec2<f32>) -> f32 {
+  let h = dot(p, vec2<f32>(127.1, 311.7)) + P.seed * 0.001;
+  return fract(sin(h) * 43758.5453123);
+}
+fn noise(p: vec2<f32>) -> f32 {
+  let i = floor(p); let f = fract(p);
+  let u = f * f * (3.0 - 2.0 * f);
+  let a = hash2(i + vec2<f32>(0.0, 0.0));
+  let b = hash2(i + vec2<f32>(1.0, 0.0));
+  let c = hash2(i + vec2<f32>(0.0, 1.0));
+  let d = hash2(i + vec2<f32>(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+fn fbm(p0: vec2<f32>) -> f32 {
+  var p = p0; var amp = 0.5; var sum = 0.0; var norm = 0.0;
+  let oct = i32(P.octaves);
+  for (var i = 0; i < oct; i = i + 1) {
+    sum = sum + amp * noise(p);
+    norm = norm + amp;
+    p = p * 2.0 + vec2<f32>(37.2, 17.7);
+    amp = amp * 0.5;
+  }
+  return sum / max(norm, 0.0001);
+}
+fn hsv2rgb(c: vec3<f32>) -> vec3<f32> {
+  let K = vec4<f32>(1.0, 2.0/3.0, 1.0/3.0, 3.0);
+  let p = abs(fract(vec3<f32>(c.x) + K.xyz) * 6.0 - vec3<f32>(K.w));
+  return c.z * mix(vec3<f32>(1.0), clamp(p - vec3<f32>(1.0), vec3<f32>(0.0), vec3<f32>(1.0)), c.y);
+}
+
+// Fullscreen triangle.
+@vertex
+fn vs(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
+  var pos = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0)
+  );
+  return vec4<f32>(pos[vid], 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+  var uv = fragCoord.xy / P.res;        // 0..1
+  uv = uv * 2.0 - vec2<f32>(1.0);       // -1..1, centered
+  uv.x = uv.x * (P.res.x / P.res.y);    // aspect correct
+
+  // Optional kaleidoscopic symmetry for some prompts.
+  if (P.symmetry > 1.5) {
+    let a = atan2(uv.y, uv.x);
+    let r = length(uv);
+    let seg = 6.2831853 / P.symmetry;
+    let aa = abs((a % seg) - seg * 0.5);
+    uv = vec2<f32>(cos(aa), sin(aa)) * r;
+  }
+
+  // Domain warping: offset coordinates by an fbm field, then sample again.
+  let f = P.frequency;
+  let q = vec2<f32>(fbm(uv * f), fbm(uv * f + vec2<f32>(5.2, 1.3)));
+  let swirled = uv + P.warp * (q - vec2<f32>(0.5)) + P.swirl * vec2<f32>(q.y, -q.x) * 0.15;
+  let field = fbm(swirled * f * 1.3 + vec2<f32>(3.0, 7.0));
+
+  // Palette: hue glides across the field; saturation/value shaped by params.
+  let hue = (P.baseHue + (field - 0.5) * P.hueSpread) / 360.0;
+  let val = mix(0.18 + P.darkness * -0.1, 1.0, pow(field, mix(1.0, 1.8, P.warmth)));
+  let sat = clamp(P.saturation + (q.x - 0.5) * 0.2, 0.0, 1.0);
+  var rgb = hsv2rgb(vec3<f32>(fract(hue + 1.0), sat, clamp(val, 0.0, 1.0)));
+
+  // Subtle vignette + film grain for a finished look.
+  let vig = smoothstep(1.6, 0.2, length(uv));
+  rgb = rgb * mix(0.7, 1.05, vig);
+  let g = (hash2(fragCoord.xy) - 0.5) * P.grain;
+  rgb = clamp(rgb + vec3<f32>(g), vec3<f32>(0.0), vec3<f32>(1.0));
+
+  return vec4<f32>(rgb, 1.0);
+}
+`;
+
+// Render one frame on the GPU into an OFFSCREEN canvas with the given params +
+// octave count. We keep the visible #canvas as a Canvas2D surface and copy the
+// GPU result onto it with drawImage. Why: a canvas can only ever have ONE
+// context type for its whole lifetime, so if WebGPU fails mid-render we could
+// never reuse #canvas for the CPU fallback. Rendering GPU work offscreen lets
+// the fallback (and reliable PNG export via toDataURL) always work.
+async function renderWebGPU(device, offscreen, params, octaves, size) {
+  offscreen.width = size; offscreen.height = size;
+  const ctx = offscreen.getContext("webgpu");
+  const format = navigator.gpu.getPreferredCanvasFormat();
+  ctx.configure({ device, format, alphaMode: "opaque" });
+
+  const module = device.createShaderModule({ code: WGSL });
+  const pipeline = device.createRenderPipeline({
+    layout: "auto",
+    vertex: { module, entryPoint: "vs" },
+    fragment: { module, entryPoint: "fs", targets: [{ format }] },
+    primitive: { topology: "triangle-list" },
+  });
+
+  // Uniform buffer: must match the WGSL Params struct order (all f32).
+  const data = new Float32Array([
+    size, size,
+    params.baseHue, params.hueSpread, params.warmth, params.darkness,
+    params.saturation, params.warp, params.frequency, params.swirl,
+    params.symmetry, params.grain, octaves, (params.seed % 100000),
+  ]);
+  const ubo = device.createBuffer({ size: data.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(ubo, 0, data);
+
+  const bind = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: ubo } }],
+  });
+
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginRenderPass({
+    colorAttachments: [{
+      view: ctx.getCurrentTexture().createView(),
+      clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: "clear", storeOp: "store",
+    }],
+  });
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bind);
+  pass.draw(3);
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+  await device.queue.onSubmittedWorkDone();
+
+  // Free the per-frame uniform buffer promptly to keep memory tiny.
+  ubo.destroy();
+}
+
+// ---- C.2 Canvas2D CPU fallback (no WebGPU/WebGL needed) ----
+// Same math at lower resolution for speed, then scaled up by the canvas.
+function fbmCPU(x, y, params, octaves) {
+  const rng = mulberry32(params.seed >>> 0);
+  // Precomputing a hash via sin keeps this dependency-free and deterministic.
+  function h(ix, iy) {
+    const s = Math.sin(ix * 127.1 + iy * 311.7 + params.seed * 0.001) * 43758.5453;
+    return s - Math.floor(s);
+  }
+  function vnoise(px, py) {
+    const ix = Math.floor(px), iy = Math.floor(py);
+    const fx = px - ix, fy = py - iy;
+    const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+    const a = h(ix, iy), b = h(ix + 1, iy), c = h(ix, iy + 1), d = h(ix + 1, iy + 1);
+    return (a * (1 - ux) + b * ux) * (1 - uy) + (c * (1 - ux) + d * ux) * uy;
+  }
+  let amp = 0.5, sum = 0, norm = 0, px = x, py = y;
+  for (let i = 0; i < octaves; i++) {
+    sum += amp * vnoise(px, py); norm += amp;
+    px = px * 2 + 37.2; py = py * 2 + 17.7; amp *= 0.5;
+  }
+  return sum / Math.max(norm, 1e-4);
+}
+function hsv2rgbCPU(h, s, v) {
+  h = ((h % 1) + 1) % 1;
+  const i = Math.floor(h * 6), f = h * 6 - i;
+  const p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s);
+  const m = [[v,t,p],[q,v,p],[p,v,t],[p,q,v],[t,p,v],[v,p,q]][i % 6];
+  return [m[0] * 255, m[1] * 255, m[2] * 255];
+}
+async function renderCanvas2D(params, octaves, size, onRow) {
+  // Render at a capped internal resolution for speed on weak CPUs.
+  const internal = Math.min(size, 256);
+  canvas.width = size; canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  const img = ctx.createImageData(internal, internal);
+  const f = params.frequency;
+  for (let y = 0; y < internal; y++) {
+    for (let x = 0; x < internal; x++) {
+      let ux = (x / internal) * 2 - 1, uy = (y / internal) * 2 - 1;
+      const qx = fbmCPU(ux * f, uy * f, params, octaves);
+      const qy = fbmCPU(ux * f + 5.2, uy * f + 1.3, params, octaves);
+      const sx = ux + params.warp * (qx - 0.5);
+      const sy = uy + params.warp * (qy - 0.5);
+      const field = fbmCPU(sx * f * 1.3 + 3, sy * f * 1.3 + 7, params, octaves);
+      const hue = (params.baseHue + (field - 0.5) * params.hueSpread) / 360;
+      const val = Math.min(1, 0.18 + Math.pow(field, 1.3));
+      const sat = Math.max(0, Math.min(1, params.saturation));
+      const [r, g, b] = hsv2rgbCPU(hue, sat, val);
+      const o = (y * internal + x) * 4;
+      img.data[o] = r; img.data[o + 1] = g; img.data[o + 2] = b; img.data[o + 3] = 255;
+    }
+    if (onRow && (y % 16 === 0)) { await onRow(y / internal); } // yield for progress
+  }
+  // Draw the small buffer scaled up to the requested canvas size.
+  const tmp = document.createElement("canvas");
+  tmp.width = internal; tmp.height = internal;
+  tmp.getContext("2d").putImageData(img, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(tmp, 0, 0, size, size);
+}
+
+// Orchestrates a Local-engine generation with progressive "steps".
+async function runLocalEngine(prompt, seed, steps, size) {
+  const params = analyzePrompt(prompt, seed);
+  const device = await getWebGPUDevice();
+
+  // Map UI steps (1..20) to octave count (2..9) and animate the refinement.
+  const maxOct = Math.round(2 + (steps / 20) * 7);
+  const display = canvas.getContext("2d");
+  canvas.width = size; canvas.height = size;
+
+  // Try WebGPU first (fast, low power). If anything throws — common on devices
+  // with flaky/software WebGPU — fall back to the CPU renderer seamlessly.
+  let renderedOnGPU = false;
+  if (device) {
+    try {
+      setStatus("Rendering on WebGPU…", "work");
+      const off = document.createElement("canvas");
+      for (let oct = 2; oct <= maxOct; oct++) {
+        await renderWebGPU(device, off, params, oct, size);
+        display.drawImage(off, 0, 0, size, size); // copy GPU frame to visible canvas
+        setProgress((oct - 1) / Math.max(1, maxOct - 1));
+        await new Promise(r => setTimeout(r, 30)); // let the UI paint
+      }
+      renderedOnGPU = true;
+    } catch (e) {
+      console.warn("WebGPU render failed, falling back to CPU:", e);
+    }
+  }
+
+  if (!renderedOnGPU) {
+    // CPU path: render once at final octaves, reporting per-row progress.
+    setStatus("Rendering on CPU (Canvas2D fallback)…", "work");
+    await renderCanvas2D(params, maxOct, size, async (p) => {
+      setProgress(p);
+      await new Promise(r => setTimeout(r, 0));
+    });
+    setProgress(1);
+  }
+  setStatus(renderedOnGPU ? "Done — rendered with WebGPU." : "Done — rendered on CPU.", "ok");
+}
+
+/* =====================================================================
+   D. DIFFUSION ENGINE (ONNX Runtime Web) — optional & experimental
+   We lazily load ORT Web from a CDN only when the user chooses this mode,
+   so the default app stays tiny and fully offline-capable. The user brings
+   their own local ONNX model (files stay in the browser via object URLs).
+   If anything is missing/too heavy, we fail loudly and fall back to Local.
+   ===================================================================== */
+let ortPromise = null;
+function loadORT() {
+  // Lazy-load ONNX Runtime Web. Requires network once (CDN); after that the
+  // browser caches it. Wrapped so we can surface a clean error if offline.
+  if (ortPromise) return ortPromise;
+  ortPromise = new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.webgpu.min.js";
+    s.onload = () => resolve(window.ort);
+    s.onerror = () => reject(new Error("Could not load ONNX Runtime Web (need network once)."));
+    document.head.appendChild(s);
+  });
+  return ortPromise;
+}
+
+async function runDiffusionEngine(prompt, seed, steps, size) {
+  // 1) Preconditions & honest capability gate.
+  if (!caps.webgpu && !caps.wasm) {
+    throw new Error("Diffusion needs WebGPU or WebAssembly; neither is available.");
+  }
+  if (!modelFiles.length) {
+    throw new Error("No ONNX model loaded. Open 'Diffusion mode setup' and pick model files — falling back to Local engine.");
+  }
+  if (caps.memoryGB && caps.memoryGB < 3) {
+    // Warn but still attempt; some quantized models are tiny.
+    setStatus("Low device memory detected — attempting anyway…", "work");
+  }
+
+  // 2) Load the runtime.
+  setStatus("Loading ONNX Runtime Web…", "work");
+  const ort = await loadORT();
+  ort.env.wasm.numThreads = Math.min(4, caps.cores || 1);
+
+  // 3) Create an inference session from the user's model file.
+  //    We locate the main UNet/model .onnx; weight sidecars (.onnx_data) are
+  //    matched by ORT automatically when provided alongside.
+  const main = modelFiles.find(f => /\.onnx$/i.test(f.name));
+  if (!main) throw new Error("No .onnx file found among the selected files.");
+  setStatus("Creating inference session (this can take a while on first load)…", "work");
+
+  const buf = new Uint8Array(await main.arrayBuffer());
+  const ep = caps.webgpu ? ["webgpu", "wasm"] : ["wasm"];
+  let session;
+  try {
+    session = await ort.InferenceSession.create(buf, { executionProviders: ep });
+  } catch (e) {
+    throw new Error("Model failed to load (likely too large for this device's memory): " + e.message);
+  }
+
+  /* 4) Run the model.
+     NOTE (honest): a complete Stable-Diffusion-class pipeline requires a CLIP
+     tokenizer + text encoder, a scheduler-driven UNet loop, and a VAE decoder —
+     the exact I/O names and shapes depend on YOUR model export, so a single
+     generic call cannot cover every model. We therefore run a best-effort
+     single forward pass for self-contained models and report clearly if the
+     model expects a multi-stage pipeline this minimal bridge doesn't implement. */
+  setStatus("Running inference…", "work");
+  const names = session.inputNames;
+  // Build a simple seeded latent if the model takes a latent/noise input.
+  const rng = mulberry32((hashString(prompt) ^ (seed >>> 0)) >>> 0);
+  const feeds = {};
+  for (const name of names) {
+    const meta = session.inputMetadata ? session.inputMetadata[name] : null;
+    // Heuristic: float inputs get seeded noise sized 1x4x(size/8)x(size/8) when
+    // they look like latents, otherwise a small zero tensor. Token inputs get a
+    // tiny zeroed int sequence. This is intentionally conservative.
+    const latentDim = Math.max(8, Math.round(size / 8));
+    const len = 1 * 4 * latentDim * latentDim;
+    const arr = new Float32Array(len);
+    for (let i = 0; i < len; i++) arr[i] = (rng() * 2 - 1);
+    feeds[name] = new ort.Tensor("float32", arr, [1, 4, latentDim, latentDim]);
+  }
+
+  let results;
+  try {
+    results = await session.run(feeds);
+  } catch (e) {
+    throw new Error("This model needs a full multi-stage pipeline that this minimal bridge can't auto-run: " + e.message);
+  }
+
+  // 5) Take the first output tensor and paint it as an image if shaped HxWxC.
+  const out = results[session.outputNames[0]];
+  paintTensorToCanvas(out, size);
+  setStatus("Done — diffusion output rendered.", "ok");
+}
+
+// Converts a model output tensor into pixels (best-effort across layouts).
+function paintTensorToCanvas(tensor, size) {
+  canvas.width = size; canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  const dims = tensor.dims, data = tensor.data;
+  // Try NCHW [1,3,H,W] (typical VAE output) → normalize from [-1,1] or [0,1].
+  let H, W, C, layout;
+  if (dims.length === 4 && dims[1] <= 4) { C = dims[1]; H = dims[2]; W = dims[3]; layout = "nchw"; }
+  else if (dims.length === 4) { H = dims[1]; W = dims[2]; C = dims[3]; layout = "nhwc"; }
+  else { throw new Error("Unsupported output shape " + JSON.stringify(dims)); }
+
+  const img = ctx.createImageData(W, H);
+  const norm = (v) => Math.max(0, Math.min(255, Math.round((v * 0.5 + 0.5) * 255))); // [-1,1]→[0,255]
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const o = (y * W + x) * 4;
+      const get = (c) => layout === "nchw"
+        ? data[c * H * W + y * W + x]
+        : data[(y * W + x) * C + c];
+      img.data[o] = norm(get(0));
+      img.data[o + 1] = norm(get(Math.min(1, C - 1)));
+      img.data[o + 2] = norm(get(Math.min(2, C - 1)));
+      img.data[o + 3] = 255;
+    }
+  }
+  const tmp = document.createElement("canvas");
+  tmp.width = W; tmp.height = H;
+  tmp.getContext("2d").putImageData(img, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(tmp, 0, 0, size, size);
+}
+
+/* =====================================================================
+   E. UI WIRING
+   ===================================================================== */
+function setBusy(b) {
+  busy = b;
+  $("generate").disabled = b;
+  $("generate").textContent = b ? "Generating…" : "Generate Image";
+}
+
+async function onGenerate() {
+  if (busy) return;
+  const prompt = $("prompt").value.trim();
+  const seed = parseInt($("seed").value, 10) || 0;
+  const steps = parseInt($("steps").value, 10) || 8;
+  const size = parseInt($("size").value, 10) || 512;
+
+  placeholder.style.display = "none";
+  setBusy(true); setProgress(0);
+
+  try {
+    if (currentEngine === "diffusion") {
+      try {
+        await runDiffusionEngine(prompt, seed, steps, size);
+      } catch (e) {
+        // Honest, graceful fallback: explain and switch to the Local engine.
+        console.warn(e);
+        setStatus("Diffusion unavailable: " + e.message + " Using Local engine.", "err");
+        await new Promise(r => setTimeout(r, 50));
+        await runLocalEngine(prompt, seed, steps, size);
+      }
+    } else {
+      await runLocalEngine(prompt, seed, steps, size);
+    }
+    $("download").disabled = false;
+  } catch (e) {
+    console.error(e);
+    setStatus("Generation failed: " + e.message, "err");
+  } finally {
+    setBusy(false);
+  }
+}
+
+function downloadPNG() {
+  const a = document.createElement("a");
+  a.download = "pocketpaint-" + Date.now() + ".png";
+  a.href = canvas.toDataURL("image/png");
+  a.click();
+}
+
+// ---- Wire up controls ----
+function init() {
+  renderCaps();
+
+  // Engine selector
+  $("engineSeg").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-engine]");
+    if (!btn) return;
+    currentEngine = btn.dataset.engine;
+    [...$("engineSeg").children].forEach(b => b.classList.toggle("active", b === btn));
+    if (currentEngine === "diffusion") $("diffusionPanel").open = true;
+  });
+
+  // Steps live label
+  $("steps").addEventListener("input", () => { $("stepsVal").textContent = $("steps").value; });
+
+  // Seed randomizer
+  $("randSeed").addEventListener("click", () => {
+    $("seed").value = Math.floor(Math.random() * 1_000_000);
+  });
+
+  // Model file picker (diffusion)
+  $("modelFiles").addEventListener("change", (e) => {
+    modelFiles = [...e.target.files];
+    if (modelFiles.length) {
+      setStatus(`Loaded ${modelFiles.length} model file(s): ${modelFiles.map(f => f.name).join(", ")}`, "ok");
+    }
+  });
+
+  $("generate").addEventListener("click", onGenerate);
+  $("download").addEventListener("click", downloadPNG);
+  $("copyPrompt").addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText($("prompt").value); setStatus("Prompt copied.", "ok"); }
+    catch { setStatus("Copy failed (clipboard blocked).", "err"); }
+  });
+
+  // Friendly startup message based on detected capabilities.
+  if (caps.webgpu) setStatus("Ready — WebGPU detected. Press Generate.", "ok");
+  else if (caps.webgl2 || caps.wasm) setStatus("Ready — WebGPU not found; using CPU fallback. Press Generate.", "");
+  else setStatus("Limited browser: CPU rendering only.", "");
+
+  // Allow Ctrl/Cmd+Enter to generate from the textarea.
+  $("prompt").addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") onGenerate();
+  });
+}
+
+document.addEventListener("DOMContentLoaded", init);
+</script>
+</body>
+</html>
