@@ -35,11 +35,11 @@ class TinyUNet(nn.Module):
     """Small conditional noise-prediction UNet for 32x32 RGB.
     32 -> 16 -> 8 -> 16 -> 32, FiLM-conditioned on (timestep, semantic condition).
     """
-    def __init__(self, c0=40, c1=64, c2=96, emb_dim=128):
+    def __init__(self, c0=40, c1=64, c2=96, emb_dim=128, cdim=CDIM):
         super().__init__()
         self.emb_dim = emb_dim
         self.t_mlp = nn.Sequential(nn.Linear(emb_dim, emb_dim), nn.SiLU(), nn.Linear(emb_dim, emb_dim))
-        self.c_mlp = nn.Sequential(nn.Linear(CDIM, emb_dim), nn.SiLU(), nn.Linear(emb_dim, emb_dim))
+        self.c_mlp = nn.Sequential(nn.Linear(cdim, emb_dim), nn.SiLU(), nn.Linear(emb_dim, emb_dim))
 
         self.stem = nn.Conv2d(3, c0, 3, padding=1)
         self.down1 = FiLMResBlock(c0, c0, emb_dim)

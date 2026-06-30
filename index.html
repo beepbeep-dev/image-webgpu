@@ -1583,6 +1583,35 @@ function unetForward(xData, S, t01, cond) {
 }
 function silu2(arr) { const o = new Float32Array(arr.length); for (let i = 0; i < arr.length; i++) o[i] = silu(arr[i]); return o; }
 
+// Tiny from-scratch text encoder (mirrors train_diffusion.py's CaptionEncoder
+// exactly): tokenize the prompt the same trivial way used at training time,
+// look up each known word's trained embedding, mean-pool over matches. The
+// vocabulary + embedding table were both learned from our own scraped real
+// photo captions, not hand-designed — this is what actually conditions the
+// "Diffusion (ours)" engine now, instead of the fixed category mapping.
+let VOCAB_INDEX = null;
+function promptToCaptionEmbedding(prompt) {
+  const { meta, T } = loadDiffusionModelWeights();
+  const dim = meta.cdim;
+  if (!VOCAB_INDEX) {
+    VOCAB_INDEX = new Map();
+    meta.vocab.forEach((w, i) => VOCAB_INDEX.set(w, i));
+  }
+  const words = prompt.toLowerCase().match(/[a-z0-9]+/g) || [];
+  const out = new Float32Array(dim);
+  let count = 0;
+  const table = T["word_emb.weight"];
+  for (const w of words) {
+    const id = VOCAB_INDEX.get(w);
+    if (id === undefined) continue;
+    const base = id * dim;
+    for (let d = 0; d < dim; d++) out[d] += table[base + d];
+    count++;
+  }
+  if (count > 0) for (let d = 0; d < dim; d++) out[d] /= count;
+  return out;
+}
+
 async function runMyDiffusionEngine(prompt, seed, steps, size) {
   setStatus("Generating with our own trained diffusion model (denoising)…", "work");
   const { meta } = loadDiffusionModelWeights();
@@ -1595,9 +1624,10 @@ async function runMyDiffusionEngine(prompt, seed, steps, size) {
   let cum = 1;
   for (let i = 0; i < TRAIN_T; i++) { cum *= (1 - betas[i]); acp[i] = cum; }
 
-  // Condition vector: reuse the same prompt→semantic-condition mapping as the
-  // neural engine (both models share the same 21-D condition layout).
-  const cond = promptToCondition(prompt);
+  // Condition vector: our own small trained text encoder (word embeddings
+  // learned from real scraped photo captions), not the hand-designed
+  // category mapping the neural engine uses.
+  const cond = promptToCaptionEmbedding(prompt);
   const rng = mulberry32((hashString(prompt) ^ (seed >>> 0) ^ 0x9e3779b9) >>> 0);
   const randn = () => {
     let u = 0, v = 0;
