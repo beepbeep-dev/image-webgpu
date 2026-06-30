@@ -97,14 +97,31 @@ from scratch** specifically to fit this 3 GB / iPad-9 target; there is also a
   channel count: 28 → 44 → 64 (down/up), embedding dim 96
   ```
 
+- **Trained from a real, structured database, not just random sampling**
+  (`model/build_dataset.py` → `model/dataset.db`, SQLite): rather than only
+  ever generating a fresh random scene every training step, I built an
+  actual training-data database that **exhaustively enumerates the
+  structural condition space** — every (4 time-of-day) × (5 biomes) ×
+  (3 mountain intensities) × (3 neon intensities) × (3 fire intensities) ×
+  (9 subjects, including "none") × (placement, when a subject is present)
+  combination — **13,500 rows**, each a real SQLite row with queryable
+  columns (`time_of_day`, `biome`, `mountain`, `neon`, `fire`, `subject`,
+  `subj_x`) plus the exact 21-D condition vector and a PNG-encoded 32×32
+  render, indexed on `time_of_day` / `biome` / `subject` so you can inspect
+  it directly (e.g. `SELECT * FROM samples WHERE biome='desert' AND
+  subject='horse'`). `model/train_diffusion.py` loads the whole database
+  into memory once and trains by sampling random *rows of it* each step
+  (with repetition — ~14 epochs over 4000 steps × batch 48), so the model
+  is genuinely fit to a fixed, inspectable dataset instead of an
+  unbounded random stream.
 - **How it was trained** (`model/train_diffusion.py` + `model/scene_diffusion.py`,
-  PyTorch, CPU-only, 4000 steps, batch 48, ~13 min): I wrote a second analytic
-  renderer (simpler/blockier than the neural model's — silhouettes built from
-  circles and rectangles, since a conv UNet picks up local shapes well even at
-  low fidelity) covering the same 21-D condition space (time of day, biome,
-  mountains/neon/fire, and 8 subjects). Standard DDPM training: sample a random
-  timestep `t`, add the corresponding amount of Gaussian noise to a fresh
-  rendered image, train the UNet to predict that noise (Adam, MSE, gradient
+  PyTorch, CPU-only, 4000 steps, batch 48, ~12 min): the renderer that built
+  the database (simpler/blockier than the neural model's — silhouettes built
+  from circles and rectangles, since a conv UNet picks up local shapes well
+  even at low fidelity) covers the same 21-D condition space (time of day,
+  biome, mountains/neon/fire, and 8 subjects). Standard DDPM training: sample
+  a random timestep `t`, add the corresponding amount of Gaussian noise to a
+  database image, train the UNet to predict that noise (Adam, MSE, gradient
   clipping, linear-warmup learning rate — without clipping the run diverged
   once around step 1000, a real failure I hit and fixed during training).
   Linear beta schedule (`1e-4 → 0.02`, T=1000), matching standard DDPM.
@@ -280,7 +297,11 @@ python3 model/train.py          # ~19 min on CPU (8000 steps) → writes model_w
 - `model/scene_diffusion.py` — analytic scene+subject renderer used as the
   diffusion model's training target (PyTorch + NumPy).
 - `model/model.py` — the small conditional UNet architecture (PyTorch).
-- `model/train_diffusion.py` — trains the diffusion model from scratch
-  (PyTorch, CPU) and exports `model/diffusion_model.json`.
+- `model/build_dataset.py` — builds `model/dataset.db`, a real SQLite
+  database that exhaustively renders the structural condition space
+  (13,500 rows).
+- `model/dataset.db` — the training dataset itself (SQLite, queryable).
+- `model/train_diffusion.py` — trains the diffusion model from
+  `model/dataset.db` (PyTorch, CPU) and exports `model/diffusion_model.json`.
 - `model/diffusion_model.json` — exported diffusion model weights (also
   embedded in `index.html`).
