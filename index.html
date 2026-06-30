@@ -321,6 +321,25 @@ const caps = {
   cores: navigator.hardwareConcurrency || null,
 };
 
+// iOS/iPadOS detection (iPadOS 13+ reports a desktop UA, hence the touch check).
+caps.ios = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
+// Conservative per-TAB memory budget for the heavy diffusion path (in MB).
+// This is NOT total RAM: mobile Safari (e.g. the 3 GB iPad 9) kills tabs far
+// below the physical limit, often around 1–1.5 GB. We budget a fraction of RAM
+// and subtract runtime overhead, then gate model loading against it so we never
+// crash the tab. Low-end target = iPad 9: 3 GB → ~880 MB usable for weights.
+caps.modelBudgetMB = (() => {
+  const gb = caps.memoryGB || (caps.ios ? 3 : 4);   // assume 3 GB if iOS hides it
+  const usable = gb * 1024 * (caps.ios ? 0.40 : 0.55) - 350;
+  return Math.max(256, Math.round(usable));
+})();
+
+// Treat as "low memory" when we should default to the lightest settings
+// (the iPad 9 and similar). Used to pick a safe default image size.
+caps.lowMemory = caps.ios || (caps.memoryGB != null && caps.memoryGB <= 3);
+
 function renderCaps() {
   const el = $("caps");
   const chip = (label, ok, neutral) =>
@@ -330,7 +349,9 @@ function renderCaps() {
     chip("WebGL2", caps.webgl2) +
     chip("WebAssembly", caps.wasm) +
     `<span class="chip">${caps.memoryGB ? "~" + caps.memoryGB + " GB RAM" : "RAM: unknown"}</span>` +
-    `<span class="chip">${caps.cores ? caps.cores + " cores" : "cores: ?"}</span>`;
+    `<span class="chip">${caps.cores ? caps.cores + " cores" : "cores: ?"}</span>` +
+    (caps.ios ? `<span class="chip">iPadOS / iOS</span>` : "") +
+    `<span class="chip">model budget ~${caps.modelBudgetMB} MB</span>`;
 }
 
 /* Acquire a WebGPU device once and cache it. Returns null if unavailable. */
@@ -720,30 +741,52 @@ async function runDiffusionEngine(prompt, seed, steps, size) {
   if (!modelFiles.length) {
     throw new Error("No ONNX model loaded. Open 'Diffusion mode setup' and pick model files — falling back to Local engine.");
   }
-  if (caps.memoryGB && caps.memoryGB < 3) {
-    // Warn but still attempt; some quantized models are tiny.
-    setStatus("Low device memory detected — attempting anyway…", "work");
-  }
 
-  // 2) Load the runtime.
-  setStatus("Loading ONNX Runtime Web…", "work");
-  const ort = await loadORT();
-  ort.env.wasm.numThreads = Math.min(4, caps.cores || 1);
-
-  // 3) Create an inference session from the user's model file.
-  //    We locate the main UNet/model .onnx; weight sidecars (.onnx_data) are
-  //    matched by ORT automatically when provided alongside.
+  // 1b) HARD MEMORY GUARD — this is the key to never crashing a low-RAM tab
+  //     (e.g. the 3 GB iPad 9). Loading a model costs roughly the file size for
+  //     the weights again inside the runtime, so the file alone must fit inside
+  //     our conservative per-tab budget. If it doesn't, refuse and let the
+  //     caller fall back to the Local engine instead of killing the tab.
   const main = modelFiles.find(f => /\.onnx$/i.test(f.name));
   if (!main) throw new Error("No .onnx file found among the selected files.");
-  setStatus("Creating inference session (this can take a while on first load)…", "work");
+  const totalMB = modelFiles.reduce((s, f) => s + f.size, 0) / (1024 * 1024);
+  if (totalMB > caps.modelBudgetMB) {
+    throw new Error(
+      `Model is ~${Math.round(totalMB)} MB but this device's safe budget is ~${caps.modelBudgetMB} MB. ` +
+      `Use a smaller / quantized (int8) model — falling back to the Local engine to protect the tab.`
+    );
+  }
 
-  const buf = new Uint8Array(await main.arrayBuffer());
+  // 2) Load the runtime with iOS-safe settings.
+  setStatus("Loading ONNX Runtime Web…", "work");
+  const ort = await loadORT();
+  // Multi-threaded WASM needs cross-origin isolation (COOP/COEP), which a plain
+  // file:// or static server doesn't have — and iOS Safari is strict about it.
+  // So we only enable threads when the page is actually cross-origin isolated.
+  ort.env.wasm.simd = true;
+  ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, caps.cores || 1) : 1;
+
+  // 3) Create an inference session from the user's model file.
+  //    To keep PEAK memory low on a 3 GB device we stream the weights via an
+  //    object URL (no second full copy in JS) when there's a single self-
+  //    contained .onnx; models with external .onnx_data sidecars need the byte
+  //    buffer path so the runtime can resolve them.
+  setStatus("Creating inference session (this can take a while on first load)…", "work");
   const ep = caps.webgpu ? ["webgpu", "wasm"] : ["wasm"];
-  let session;
+  const hasSidecar = modelFiles.length > 1;
+  let session, objUrl = null;
   try {
-    session = await ort.InferenceSession.create(buf, { executionProviders: ep });
+    if (hasSidecar) {
+      const buf = new Uint8Array(await main.arrayBuffer());
+      session = await ort.InferenceSession.create(buf, { executionProviders: ep });
+    } else {
+      objUrl = URL.createObjectURL(main);   // runtime fetches/maps it directly
+      session = await ort.InferenceSession.create(objUrl, { executionProviders: ep });
+    }
   } catch (e) {
     throw new Error("Model failed to load (likely too large for this device's memory): " + e.message);
+  } finally {
+    if (objUrl) URL.revokeObjectURL(objUrl); // weights are in the session now
   }
 
   /* 4) Run the model.
@@ -763,7 +806,10 @@ async function runDiffusionEngine(prompt, seed, steps, size) {
     // Heuristic: float inputs get seeded noise sized 1x4x(size/8)x(size/8) when
     // they look like latents, otherwise a small zero tensor. Token inputs get a
     // tiny zeroed int sequence. This is intentionally conservative.
-    const latentDim = Math.max(8, Math.round(size / 8));
+    // On low-memory devices we cap the working resolution at 256 px so the
+    // latent/activation tensors stay small (256 px still satisfies the minimum).
+    const workSize = caps.lowMemory ? Math.min(size, 256) : size;
+    const latentDim = Math.max(8, Math.round(workSize / 8));
     const len = 1 * 4 * latentDim * latentDim;
     const arr = new Float32Array(len);
     for (let i = 0; i < len; i++) arr[i] = (rng() * 2 - 1);
@@ -867,6 +913,11 @@ function downloadPNG() {
 // ---- Wire up controls ----
 function init() {
   renderCaps();
+
+  // On low-memory / iOS devices (e.g. the iPad 9) default to the lightest
+  // image size so the app stays comfortably within the memory budget. 256 px
+  // is the minimum we offer, satisfying the "at least 256×256" requirement.
+  if (caps.lowMemory) $("size").value = "256";
 
   // Engine selector
   $("engineSeg").addEventListener("click", (e) => {

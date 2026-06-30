@@ -5,8 +5,10 @@ in the browser. No backend, no cloud API, no login, no paid service, and **no
 Node.js needed to run the finished app** — just open the file.
 
 It is built to start instantly and stay within a **~3 GB RAM** budget on low-end
-devices, while still using modern in-browser inference tech (WebGPU / WebAssembly
-/ ONNX Runtime Web).
+devices — explicitly including the **iPad 9 (3 GB, iPadOS Safari)** — while still
+using modern in-browser inference tech (WebGPU / WebAssembly / ONNX Runtime Web).
+Output is **at least 256 × 256 px** (default size on low-memory devices) and up to
+640 × 640 on capable hardware.
 
 ---
 
@@ -15,8 +17,11 @@ devices, while still using modern in-browser inference tech (WebGPU / WebAssembl
 - **Text prompt box**, **Generate** button, and a live **preview** canvas.
 - **Progress bar + status messages** while loading/generating.
 - **Settings:** image size (256–640), **seed** (reproducible), and **steps**.
-- **Capability detection** (WebGPU / WebGL2 / WebAssembly / device RAM / cores)
-  with **graceful error handling and fallbacks**.
+- **Capability detection** (WebGPU / WebGL2 / WebAssembly / device RAM / cores /
+  iOS) with **graceful error handling and fallbacks**.
+- **Per-tab memory budget guard** so the heavy diffusion path never crashes a
+  low-RAM tab (e.g. iPad 9). Oversized models are refused with a clear message
+  and the app falls back to the Local engine.
 - **Download PNG** and **copy prompt**.
 - Clean, modern dark UI. All code + comments are in the one HTML file.
 
@@ -54,6 +59,19 @@ The app ships **two engines**:
 3 GB device, so the **default working version** is the lightweight procedural
 engine, with an honest, optional path to real diffusion for users who have both a
 capable device and a small model.
+
+### Will it run on an iPad 9?
+**Yes — the Local engine does, reliably, at 256–512 px.** It uses only a few MB of
+memory and runs as a WebGPU shader (or Canvas2D CPU fallback in older Safari), so
+it starts instantly and won't be killed by Safari's tab-memory limits. On
+low-memory/iOS devices the app auto-selects **256 × 256** as the default size.
+
+The **Diffusion engine is gated by a memory budget**: iPadOS Safari terminates
+tabs well below the 3 GB physical limit (often ~1–1.5 GB), so the app computes a
+conservative budget (~880 MB of model weights for a 3 GB iPad) and **refuses any
+model larger than that**, falling back to the Local engine instead of crashing.
+In practice a full Stable-Diffusion model will be refused on an iPad 9; only a very
+small quantized model could load — and the app tells you honestly either way.
 
 ---
 
