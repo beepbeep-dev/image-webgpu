@@ -55,12 +55,17 @@ def process_page(p, seen_pageids):
     if raw is None:
         return None
     try:
-        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        img = Image.open(io.BytesIO(raw))
+        # JPEG "draft mode": decode at a reduced internal DCT scale when we're
+        # about to downsize a lot anyway (850px source -> 256px output) —
+        # much cheaper than a full-resolution decode followed by a resize.
+        img.draft("RGB", (OUT_SIZE, OUT_SIZE))
+        img = img.convert("RGB")
     except Exception:
         return None
     if min(img.size) < OUT_SIZE:
         return None
-    img = center_crop_square(img).resize((OUT_SIZE, OUT_SIZE), Image.LANCZOS)
+    img = center_crop_square(img).resize((OUT_SIZE, OUT_SIZE), Image.BILINEAR)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=90)   # JPEG: photos compress far smaller than PNG at this res
     return (pid, p.get("title", ""), artist, license_short, caption,
