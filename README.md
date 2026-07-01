@@ -100,21 +100,28 @@ from scratch** specifically to fit this 3 GB / iPad-9 target; there is also a
 
 - **Trained on a real, captioned photo database I scraped myself — not
   synthetic renders.** `model/scrape_dataset.py` queries the **Wikimedia
-  Commons API** (**343 search topics** — landscapes/weather, ~55 animal
-  species, vehicles/transport, food & drink, architecture & places,
-  sports & activities, everyday interiors, textures/phenomena, space,
+  Commons API** (**485 search topics** — landscapes/weather, ~70 animal
+  species, vehicles/transport, food & drink, architecture & famous
+  landmarks, sports & activities, everyday objects & interiors, human
+  activities/portraits, celebrations, textures/phenomena, space,
   instruments/tech, plants) and downloads real photographs with their real
-  captions/descriptions into `model/dataset_real.db` (SQLite, **12,934
+  captions/descriptions into `model/dataset_real.db` (SQLite, **27,487
   rows**: page id, query, title, caption, artist, license, source URL, and
-  a center-cropped 32×32 PNG). Every file on Wikimedia Commons is required
-  by Commons policy to be public domain or under a free license permitting
-  reuse and derivative works (no NC/ND content is hosted there at all), so
-  this is a legally clean source for training a derivative model — full
-  attribution (artist, license, source URL) is kept per-row for
-  transparency. A keyword filter drops obvious non-photos (paintings,
-  collages, maps, diagrams, screenshots), and captions are cleaned of
-  Wikidata template leakage (e.g. `label QS:Len,"..."`) and placeholder
-  text (`"See title"`) before being stored.
+  a center-cropped 32×32 PNG). Downloads run through a 16-worker thread
+  pool (network fetch + decode/resize per candidate image in parallel;
+  all SQLite writes stay on the main thread), which cut scraping time by
+  roughly **13×** versus the original one-image-at-a-time version. Every
+  file on Wikimedia Commons is required by Commons policy to be public
+  domain or under a free license permitting reuse and derivative works (no
+  NC/ND content is hosted there at all), so this is a legally clean source
+  for training a derivative model — full attribution (artist, license,
+  source URL) is kept per-row for transparency. A keyword filter drops
+  obvious non-photos (paintings, collages, maps, diagrams, screenshots),
+  and captions are cleaned of Wikidata template leakage (e.g.
+  `label QS:Len,"..."`) and placeholder text (`"See title"`) before being
+  stored. (The database itself isn't committed to the repo — at this size
+  it's a regenerable build artifact, not something that belongs in source
+  control; run the script to rebuild it.)
 - **A tiny from-scratch TEXT ENCODER, also trained by me, replaces the
   neural model's fixed category vector.** Instead of mapping prompts to a
   hand-designed 21-D vector, this model learns its own **1,400-word
@@ -127,25 +134,45 @@ from scratch** specifically to fit this 3 GB / iPad-9 target; there is also a
   vocabulary it ends up caring about is whatever the photos' real captions
   actually used (`park`, `street`, `forest`, `sunset`, `mountain`, `horse`,
   `elephant`, `desert`, `guitar`, `galaxy`, ...).
+- **Two standard quality techniques, added after the first version looked
+  noisy/incoherent:**
+  - **EMA (exponential moving average) of the weights.** Instead of
+    shipping the raw end-of-training weights (noisy, since Adam keeps
+    perturbing them step to step), a shadow-averaged copy (decay 0.999) is
+    tracked throughout training and *that's* what gets exported — visibly
+    smoother, less grainy samples for the same architecture and data.
+  - **Classifier-free guidance (CFG).** During training, captions are
+    randomly zeroed out 15% of the time so the model also learns the
+    *unconditional* denoising distribution. At generation time, the JS
+    side runs the UNet twice per step (once with your prompt's embedding,
+    once with a zero vector) and extrapolates *away* from the
+    unconditional prediction toward the conditional one
+    (`guidance_scale=3.0`, baked into the model's metadata) — this is the
+    single biggest lever for prompt-adherence/coherence in small diffusion
+    models and produces noticeably cleaner, less speckled output than
+    without it.
 - **How it was trained** (`model/train_diffusion.py`, PyTorch, CPU-only,
-  12,000 steps, batch 64, ~101 min): the whole database is decoded into
+  16,000 steps, batch 64, ~3 hours): the whole database is decoded into
   memory once; each step samples a random batch of real (image, caption)
-  rows, embeds the captions through the word-embedding table, adds noise
-  at a random timestep, and trains the UNet (+ text encoder, same
-  optimizer) to predict that noise — standard DDPM (Adam, MSE, gradient
-  clipping, linear-warmup learning rate; linear beta schedule
-  `1e-4 → 0.02`, T=1000).
-- **How it runs in the browser:** the trained weights — UNet + the word
-  embedding table + the learned vocabulary — are embedded in this file
-  (`#pp-diffusion-model`, float32, base64, ~3.3 MB) and decoded on first
-  use. Your prompt is tokenized and embedded by a JS port of the exact
-  same rule (`promptToCaptionEmbedding`), then **DDIM sampling** (Steps
-  slider, 1–20 denoising steps) runs fully client-side in plain JavaScript
-  (conv2d, FiLM, nearest-upsample, embedding lookup all hand-implemented
-  as typed-array loops; no WebGPU/WASM/ONNX dependency, so it runs on
-  literally any device this app supports, including the iPad 9). Both the
-  UNet forward pass and the caption-embedding lookup were numerically
-  cross-checked against the PyTorch model (max abs diff ~1e-6 / exact
+  rows, embeds the captions through the word-embedding table (with CFG
+  dropout applied), adds noise at a random timestep, and trains the UNet
+  (+ text encoder, same optimizer, same Adam/MSE/gradient-clipping/
+  linear-warmup setup as before) to predict that noise. The loss had a
+  couple of brief spikes mid-run (a known small-model diffusion-training
+  quirk) but recovered within ~200 steps each time and finished stable.
+- **How it runs in the browser:** the trained (EMA) weights — UNet + the
+  word embedding table + the learned vocabulary + the guidance scale — are
+  embedded in this file (`#pp-diffusion-model`, float32, base64, ~4.3 MB)
+  and decoded on first use. Your prompt is tokenized and embedded by a JS
+  port of the exact same rule (`promptToCaptionEmbedding`), then **DDIM
+  sampling with classifier-free guidance** (Steps slider, 1–20 denoising
+  steps, two UNet forward passes per step) runs fully client-side in plain
+  JavaScript (conv2d, FiLM, nearest-upsample, embedding lookup all
+  hand-implemented as typed-array loops; no WebGPU/WASM/ONNX dependency,
+  so it runs on literally any device this app supports, including the
+  iPad 9, just a bit slower per image with the extra forward pass). Both
+  the UNet forward pass and the caption-embedding lookup were numerically
+  cross-checked against the PyTorch model (max abs diff ~2e-6 / exact
   match respectively) before shipping.
 - **Why this is a genuinely different thing from the 🧬 Neural model:** different
   training data (real scraped photographs vs. an analytic renderer), different
@@ -155,16 +182,17 @@ from scratch** specifically to fit this 3 GB / iPad-9 target; there is also a
   coordinate→RGB field), and a real multi-step sampling loop instead of one
   forward pass.
 - **Honest limitation:** at 32×32 working resolution, ~831k parameters, and
-  ~12.9k real training photos (vs. billions of images / billions of parameters
-  for an actual Stable Diffusion), output is abstract/impressionistic — it
-  picks up rough color palette and mood from the prompt (e.g. warm tones for
-  "sunset", blue-black for "night sky", green for "forest") but not sharp
-  recognizable objects. Real-world photos are a much harder training target
-  than the neural model's clean analytic renders, and this is an honest,
-  tiny, from-scratch model, not a scaled one. It's offered alongside the
-  neural model precisely so you can see the difference between the two
-  model families and the two training data sources, side by side, both
-  made from scratch, both fully local.
+  ~27.5k real training photos (vs. billions of images / billions of parameters
+  for an actual Stable Diffusion), output is still abstract/impressionistic —
+  EMA + CFG made it noticeably cleaner and more coherent (larger solid color
+  regions, less speckle noise) but it picks up rough color palette and mood
+  from the prompt (e.g. warm tones for "sunset", blue-black for "night sky",
+  green for "forest") rather than sharp recognizable objects. Real-world
+  photos are a much harder training target than the neural model's clean
+  analytic renders, and this is an honest, tiny, from-scratch model, not a
+  scaled one. It's offered alongside the neural model precisely so you can
+  see the difference between the two model families and the two training
+  data sources, side by side, both made from scratch, both fully local.
 
 ### B. ⚡ Procedural — WebGPU shader (broadest compatibility)
 - A hand-written **WebGPU** fragment shader (WGSL) with a **Canvas2D CPU fallback**:
