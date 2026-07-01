@@ -17,8 +17,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, PngImagePlugin
 from model import TinyUNet
+
+PngImagePlugin.MAX_TEXT_CHUNK = 100 * 1024 * 1024  # some source photos carry large ICC profiles
 
 torch.manual_seed(0)
 rng = np.random.default_rng(0)
