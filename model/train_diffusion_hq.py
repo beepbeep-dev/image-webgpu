@@ -113,43 +113,71 @@ class CaptionEncoder(nn.Module):
         return summed / count
 
 
-device = "cpu"
-CHANNELS = (16, 24, 36, 54, 80, 112)
-EMB_DIM = 160
+device = "cuda" if torch.cuda.is_available() else "cpu"
+use_amp = device == "cuda"   # bf16 autocast on GPU: ~2x+ speedup, no loss-scaler needed (Ampere/Ada+)
+print("device:", device, " mixed precision:", use_amp)
+
+# ~109M params — a genuine "quality" step up from the original 1.56M tiny
+# model, sized to actually be learnable from our ~100k-image dataset without
+# badly overfitting (unlike an even bigger model would on this much data).
+CHANNELS = (150, 225, 340, 510, 720, 1000)
+EMB_DIM = 384
 model = BigUNet(channels=CHANNELS, emb_dim=EMB_DIM, cdim=EMBED_DIM).to(device)
 cap_enc = CaptionEncoder(len(vocab), EMBED_DIM).to(device)
-print("UNet params:", model.param_count(), " caption encoder params:",
-      sum(p.numel() for p in cap_enc.parameters()))
+print("UNet params:", f"{model.param_count():,}", " caption encoder params:",
+      f"{sum(p.numel() for p in cap_enc.parameters()):,}")
 
-LR = 1e-3
-WARMUP = 300
+LR = 1e-4               # lower than the tiny model's 1e-3: bigger model, be conservative
+WARMUP = 500
 UNCOND_P = 0.15
 GUIDANCE_SCALE = 3.0
-EMA_DECAY = 0.999
+EMA_DECAY = 0.9995
 opt = torch.optim.Adam(list(model.parameters()) + list(cap_enc.parameters()), lr=LR)
 
 all_params = list(model.named_parameters()) + [("word_emb." + k, v) for k, v in cap_enc.embed.named_parameters()]
 ema = {name: p.detach().clone() for name, p in all_params}
 
-STEPS = 8000
-BATCH = 16
+STEPS = 30000
+BATCH = 48 if device == "cuda" else 8
+
+# Background prefetch: decode the NEXT batch's images on a worker thread
+# while the GPU is busy with the CURRENT step, so SQLite/JPEG decoding isn't
+# sitting in the critical path once the GPU makes each step fast.
+import threading, queue as queue_mod
+_batch_queue = queue_mod.Queue(maxsize=4)
+
+
+def _producer():
+    while True:
+        _batch_queue.put(make_batch(BATCH))
+
+
+threading.Thread(target=_producer, daemon=True).start()
+
+sqrt_acp_d = sqrt_acp.to(device)
+sqrt_1m_acp_d = sqrt_1m_acp.to(device)
+
 t0 = time.time()
 ema_loss = None
 for step in range(1, STEPS + 1):
-    x0, ids_b, mask_b = make_batch(BATCH)
-    t_idx = torch.randint(0, T, (BATCH,))
+    x0, ids_b, mask_b = _batch_queue.get()
+    x0 = x0.to(device, non_blocking=True)
+    ids_b = ids_b.to(device, non_blocking=True)
+    mask_b = mask_b.to(device, non_blocking=True)
+    t_idx = torch.randint(0, T, (BATCH,), device=device)
     noise = torch.randn_like(x0)
-    xt = sqrt_acp[t_idx][:, None, None, None] * x0 + sqrt_1m_acp[t_idx][:, None, None, None] * noise
+    xt = sqrt_acp_d[t_idx][:, None, None, None] * x0 + sqrt_1m_acp_d[t_idx][:, None, None, None] * noise
 
     for g in opt.param_groups:
         g["lr"] = LR * min(1.0, step / WARMUP)
 
     opt.zero_grad()
-    cond = cap_enc(ids_b, mask_b)
-    uncond_mask = (torch.rand(BATCH, 1) < UNCOND_P).float()
-    cond = cond * (1.0 - uncond_mask)
-    pred = model(xt, t_idx.float() / T, cond)
-    loss = F.mse_loss(pred, noise)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=use_amp):
+        cond = cap_enc(ids_b, mask_b)
+        uncond_mask = (torch.rand(BATCH, 1, device=device) < UNCOND_P).float()
+        cond = cond * (1.0 - uncond_mask)
+        pred = model(xt, t_idx.float() / T, cond)
+        loss = F.mse_loss(pred, noise)
     loss.backward()
     torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(cap_enc.parameters()), 1.0)
     opt.step()

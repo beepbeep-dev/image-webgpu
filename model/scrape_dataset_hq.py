@@ -6,8 +6,8 @@ each query's search results (via gsroffset) to reach ~100k images instead of
 ~90 per query. Reuses all the filtering/cleaning/licensing logic from
 scrape_dataset.py so both datasets are curated the same way.
 """
-import io, sys, time, sqlite3
-from concurrent.futures import ThreadPoolExecutor
+import io, sys, threading, time, sqlite3
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image
 from scrape_dataset import (
     QUERIES, UA, api_get, fetch_bytes, clean_caption, looks_like_photo,
@@ -67,6 +67,38 @@ def process_page(p, seen_pageids):
             info.get("descriptionurl", ""), buf.getvalue())
 
 
+def fetch_query_pages(q, img_pool, seen_pageids):
+    """Runs the full sequential pagination chain for one query (search ->
+    download candidate images -> next page's search -> ...) and returns the
+    list of successfully processed (not-yet-inserted) results. This is the
+    unit of work run CONCURRENTLY across many queries at once — the search+
+    continuation round-trips are the real bottleneck (network latency, not
+    CPU), so overlapping many queries' round-trips is what actually speeds
+    this up, more than parallelizing downloads within a single query does."""
+    results = []
+    continue_params = {}
+    for page_num in range(PAGES_PER_QUERY):
+        params = {
+            "action": "query", "generator": "search", "gsrsearch": q,
+            "gsrlimit": PAGE_SIZE, "gsrnamespace": 6,
+            "prop": "imageinfo", "iiprop": "url|extmetadata|size",
+            "iiurlwidth": THUMB_W,
+        }
+        params.update(continue_params)
+        data = api_get(params)
+        if not data or "query" not in data:
+            break
+        pages = list(data["query"]["pages"].values())
+        for result in img_pool.map(lambda p: process_page(p, seen_pageids), pages):
+            if result is not None:
+                results.append(result)
+        cont = data.get("continue")
+        if not cont:
+            break
+        continue_params = cont
+    return results
+
+
 def main():
     resume = "--resume" in sys.argv
     con = sqlite3.connect("dataset_hq.db")
@@ -96,26 +128,17 @@ def main():
         print(f"resuming: {len(seen_pageids)} rows already saved")
     total_saved = len(seen_pageids)
     t0 = time.time()
-    pool = ThreadPoolExecutor(max_workers=16)
 
-    for qi, q in enumerate(QUERIES):
+    img_pool = ThreadPoolExecutor(max_workers=48)     # per-page image download/decode parallelism
+    query_pool = ThreadPoolExecutor(max_workers=12)   # concurrent queries, to overlap search-latency
+    db_lock = threading.Lock()
+    done_count = 0
+
+    def insert_results(q, results):
+        nonlocal total_saved
         saved_here = 0
-        continue_params = {}
-        for page_num in range(PAGES_PER_QUERY):
-            params = {
-                "action": "query", "generator": "search", "gsrsearch": q,
-                "gsrlimit": PAGE_SIZE, "gsrnamespace": 6,
-                "prop": "imageinfo", "iiprop": "url|extmetadata|size",
-                "iiurlwidth": THUMB_W,
-            }
-            params.update(continue_params)   # MediaWiki continuation: merge the whole dict back in
-            data = api_get(params)
-            if not data or "query" not in data:
-                break
-            pages = list(data["query"]["pages"].values())
-            for result in pool.map(lambda p: process_page(p, seen_pageids), pages):
-                if result is None:
-                    continue
+        with db_lock:
+            for result in results:
                 pid, title, artist, license_short, caption, source_url, jpg_bytes = result
                 if pid in seen_pageids:
                     continue
@@ -128,14 +151,16 @@ def main():
                 saved_here += 1
                 total_saved += 1
             con.commit()
-            cont = data.get("continue")
-            if not cont:
-                break   # search results genuinely exhausted
-            # A dict with only "iicontinue" (no "gsroffset" yet) is a normal
-            # intermediate step in MediaWiki's dependent continuation — merge
-            # it back in and make one more request rather than stopping early.
-            continue_params = cont
-        print(f"[{qi+1}/{len(QUERIES)}] {q!r}: +{saved_here} (total {total_saved})  ({time.time()-t0:.0f}s)")
+        return saved_here
+
+    futures = {query_pool.submit(fetch_query_pages, q, img_pool, seen_pageids): (qi, q)
+               for qi, q in enumerate(QUERIES)}
+    for future in as_completed(futures):
+        qi, q = futures[future]
+        results = future.result()
+        saved_here = insert_results(q, results)
+        done_count += 1
+        print(f"[{done_count}/{len(QUERIES)}] {q!r}: +{saved_here} (total {total_saved})  ({time.time()-t0:.0f}s)")
 
     print("done:", total_saved, "rows in", time.time() - t0, "s")
     con.close()
