@@ -3,3 +3,5 @@ __pycache__/
 model/*.log
 model/dataset_real.db-journal
 model/dataset_real.db
+model/dataset_hq.db-journal
+model/dataset_hq.db
