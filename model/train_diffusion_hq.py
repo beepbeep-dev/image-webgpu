@@ -13,6 +13,8 @@ preloaded into RAM: at 256x256, the full ~100k-image dataset would need
 ~80GB as float32, far more than this machine has, so each step fetches and
 JPEG-decodes only the BATCH images it actually needs.
 """
+import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import io, json, re, sqlite3, time
 import numpy as np
 import torch
@@ -137,8 +139,10 @@ opt = torch.optim.Adam(list(model.parameters()) + list(cap_enc.parameters()), lr
 all_params = list(model.named_parameters()) + [("word_emb." + k, v) for k, v in cap_enc.embed.named_parameters()]
 ema = {name: p.detach().clone() for name, p in all_params}
 
-STEPS = 30000
-BATCH = 48 if device == "cuda" else 8
+STEPS = 12000  # trimmed from 30000: the actual scraped dataset (~6.7k images)
+                # is much smaller than the ~100k originally planned, so fewer
+                # steps reduces overfitting risk and GPU cost proportionally
+BATCH = 16 if device == "cuda" else 8   # 48 OOM'd a 24GB GPU at 256x256 with this ~109M-param model
 
 # Background prefetch: decode the NEXT batch's images on a worker thread
 # while the GPU is busy with the CURRENT step, so SQLite/JPEG decoding isn't
