@@ -1,10 +1,5 @@
 __pycache__/
 *.pyc
-model/train_db.log
-model/train.log
-model/train_real.log
+model/*.log
 model/dataset_real.db-journal
-model/scrape_full.log
-model/train_full.log
-model/scrape_v2.log
 model/dataset_real.db

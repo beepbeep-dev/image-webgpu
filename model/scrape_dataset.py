@@ -9,6 +9,7 @@ source URL) per row for transparency.
 """
 import html, io, json, re, sqlite3, sys, time
 import urllib.request, urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
 
 API = "https://commons.wikimedia.org/w/api.php"
@@ -299,6 +300,50 @@ def main():
               f"re-run with a higher per-query limit so already-scraped topics get topped up with new results too)")
     total_saved = len(seen_pageids)
     t0 = time.time()
+    pool = ThreadPoolExecutor(max_workers=16)
+
+    def process_page(p):
+        """Runs in a worker thread: filter + download + decode + resize only
+        (no SQLite access here — all DB writes happen back on the main thread)."""
+        pid = p.get("pageid")
+        if pid in seen_pageids:
+            return None
+        info = p.get("imageinfo")
+        if not info:
+            return None
+        info = info[0]
+        thumb_url = info.get("thumburl")
+        if not thumb_url or not re.search(r"\.(jpe?g|png)$", thumb_url, re.I):
+            return None
+        em = info.get("extmetadata", {})
+        license_short = em.get("LicenseShortName", {}).get("value", "unknown")
+        artist_raw = em.get("Artist", {}).get("value", "")
+        artist = re.sub(r"<[^>]+>", "", html.unescape(artist_raw)).strip()[:120]
+        desc = em.get("ImageDescription", {}).get("value", "") or em.get("ObjectName", {}).get("value", "")
+        caption = clean_caption(p.get("title", ""), desc)
+        categories = em.get("Categories", {}).get("value", "")
+        if len(caption) < 3 or not looks_like_photo(caption, categories):
+            return None
+        if info.get("width", 0) and info.get("height", 0):
+            ar = info["width"] / max(1, info["height"])
+            if ar > 3.2 or ar < 1 / 3.2:   # skip extreme panoramas/strips
+                return None
+
+        raw = fetch_bytes(thumb_url)
+        if raw is None:
+            return None
+        try:
+            img = Image.open(io.BytesIO(raw)).convert("RGB")
+        except Exception:
+            return None
+        if min(img.size) < 16:
+            return None
+        img = center_crop_square(img).resize((OUT_SIZE, OUT_SIZE), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return (pid, p.get("title", ""), artist, license_short, caption,
+                info.get("descriptionurl", ""), buf.getvalue())
+
     for qi, q in enumerate(QUERIES):
         data = api_get({
             "action": "query", "generator": "search", "gsrsearch": q,
@@ -311,54 +356,20 @@ def main():
             continue
         pages = list(data["query"]["pages"].values())
         saved_here = 0
-        for p in pages:
-            pid = p.get("pageid")
-            if pid in seen_pageids:
+        for result in pool.map(process_page, pages):
+            if result is None:
                 continue
-            info = p.get("imageinfo")
-            if not info:
+            pid, title, artist, license_short, caption, source_url, png_bytes = result
+            if pid in seen_pageids:   # a concurrent duplicate across queries
                 continue
-            info = info[0]
-            mime_ok = True
-            thumb_url = info.get("thumburl")
-            if not thumb_url or not re.search(r"\.(jpe?g|png)$", thumb_url, re.I):
-                continue
-            em = info.get("extmetadata", {})
-            license_short = em.get("LicenseShortName", {}).get("value", "unknown")
-            artist_raw = em.get("Artist", {}).get("value", "")
-            artist = re.sub(r"<[^>]+>", "", html.unescape(artist_raw)).strip()[:120]
-            desc = em.get("ImageDescription", {}).get("value", "") or em.get("ObjectName", {}).get("value", "")
-            caption = clean_caption(p.get("title", ""), desc)
-            categories = em.get("Categories", {}).get("value", "")
-            if len(caption) < 3 or not looks_like_photo(caption, categories):
-                continue
-            if info.get("width", 0) and info.get("height", 0):
-                ar = info["width"] / max(1, info["height"])
-                if ar > 3.2 or ar < 1 / 3.2:   # skip extreme panoramas/strips
-                    continue
-
-            raw = fetch_bytes(thumb_url)
-            if raw is None:
-                continue
-            try:
-                img = Image.open(io.BytesIO(raw)).convert("RGB")
-            except Exception:
-                continue
-            if min(img.size) < 16:
-                continue
-            img = center_crop_square(img).resize((OUT_SIZE, OUT_SIZE), Image.LANCZOS)
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-
             seen_pageids.add(pid)
             cur.execute(
                 "INSERT OR IGNORE INTO samples (page_id,query,title,caption,artist,license,"
                 "source_url,width,height,image) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (pid, q, p.get("title", ""), caption, artist, license_short,
-                 info.get("descriptionurl", ""), OUT_SIZE, OUT_SIZE, buf.getvalue()))
+                (pid, q, title, caption, artist, license_short,
+                 source_url, OUT_SIZE, OUT_SIZE, png_bytes))
             saved_here += 1
             total_saved += 1
-            time.sleep(0.05)
         con.commit()
         print(f"[{qi+1}/{len(QUERIES)}] {q!r}: +{saved_here} (total {total_saved})  ({time.time()-t0:.0f}s)")
 
