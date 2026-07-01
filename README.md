@@ -85,54 +85,59 @@ from scratch** specifically to fit this 3 GB / iPad-9 target; there is also a
   UNet** trained to predict the noise added to a 32×32 image at a random
   timestep, then sampled by iterative denoising starting from pure Gaussian
   noise. It is a real instance of the same family of model SD-Turbo belongs
-  to, just tiny: **~469,000 parameters total**, working resolution 32×32
-  (upscaled to the requested output size).
+  to, just tiny: **~831,000 parameters total** (741k UNet + 90k text encoder),
+  working resolution 32×32 (upscaled to the requested output size).
 
   ```
   UNet: 32×32 → (down, stride-2 conv) 16×16 → (down) 8×8 → mid (2 FiLM ResBlocks)
         → (up, nearest+conv, skip-concat) 16×16 → (up) 32×32 → 3ch noise pred
   Each level: FiLM residual block — conv3x3 → SiLU → FiLM(scale,shift from
   timestep+condition embedding) → SiLU → conv3x3 → + residual
-  Conditioning: sinusoidal timestep embedding + a 48-D CAPTION embedding
+  Conditioning: sinusoidal timestep embedding + a 64-D CAPTION embedding
   (see below), summed and fed to every FiLM block
-  channel count: 28 → 44 → 64 (down/up), UNet embedding dim 96
+  channel count: 36 → 58 → 84 (down/up), UNet embedding dim 128
   ```
 
 - **Trained on a real, captioned photo database I scraped myself — not
   synthetic renders.** `model/scrape_dataset.py` queries the **Wikimedia
-  Commons API** (115 search topics spanning nature, animals, vehicles,
-  cities, weather, people, plants...) and downloads real photographs with
-  their real captions/descriptions into `model/dataset_real.db` (SQLite,
-  **4,389 rows**: page id, query, title, caption, artist, license,
-  source URL, and a center-cropped 32×32 PNG). Every file on Wikimedia
-  Commons is required by Commons policy to be public domain or under a
-  free license permitting reuse and derivative works (no NC/ND content is
-  hosted there at all), so this is a legally clean source for training a
-  derivative model — full attribution (artist, license, source URL) is
-  kept per-row for transparency. A keyword filter drops obvious non-photos
-  (paintings, collages, maps, diagrams, screenshots) before they're saved.
+  Commons API** (**343 search topics** — landscapes/weather, ~55 animal
+  species, vehicles/transport, food & drink, architecture & places,
+  sports & activities, everyday interiors, textures/phenomena, space,
+  instruments/tech, plants) and downloads real photographs with their real
+  captions/descriptions into `model/dataset_real.db` (SQLite, **12,934
+  rows**: page id, query, title, caption, artist, license, source URL, and
+  a center-cropped 32×32 PNG). Every file on Wikimedia Commons is required
+  by Commons policy to be public domain or under a free license permitting
+  reuse and derivative works (no NC/ND content is hosted there at all), so
+  this is a legally clean source for training a derivative model — full
+  attribution (artist, license, source URL) is kept per-row for
+  transparency. A keyword filter drops obvious non-photos (paintings,
+  collages, maps, diagrams, screenshots), and captions are cleaned of
+  Wikidata template leakage (e.g. `label QS:Len,"..."`) and placeholder
+  text (`"See title"`) before being stored.
 - **A tiny from-scratch TEXT ENCODER, also trained by me, replaces the
   neural model's fixed category vector.** Instead of mapping prompts to a
-  hand-designed 21-D vector, this model learns its own **800-word
+  hand-designed 21-D vector, this model learns its own **1,400-word
   vocabulary** straight from the scraped captions and a **trainable word
-  embedding table** (48-D). A caption (or, at inference time, your prompt)
+  embedding table** (64-D). A caption (or, at inference time, your prompt)
   is tokenized with a trivial rule (lowercase, split on non-alphanumerics,
   drop stopwords) and turned into one vector by **mean-pooling the
   embeddings of its known words** — a minimal bag-of-words text encoder,
   trained jointly with the UNet on the actual denoising loss, so the
   vocabulary it ends up caring about is whatever the photos' real captions
   actually used (`park`, `street`, `forest`, `sunset`, `mountain`, `horse`,
-  `desert`, ...).
+  `elephant`, `desert`, `guitar`, `galaxy`, ...).
 - **How it was trained** (`model/train_diffusion.py`, PyTorch, CPU-only,
-  6000 steps, batch 48, ~18 min): the whole database is decoded into memory
-  once; each step samples a random batch of real (image, caption) rows,
-  embeds the captions through the word-embedding table, adds noise at a
-  random timestep, and trains the UNet (+ text encoder, same optimizer) to
-  predict that noise — standard DDPM (Adam, MSE, gradient clipping,
-  linear-warmup learning rate; linear beta schedule `1e-4 → 0.02`, T=1000).
+  12,000 steps, batch 64, ~101 min): the whole database is decoded into
+  memory once; each step samples a random batch of real (image, caption)
+  rows, embeds the captions through the word-embedding table, adds noise
+  at a random timestep, and trains the UNet (+ text encoder, same
+  optimizer) to predict that noise — standard DDPM (Adam, MSE, gradient
+  clipping, linear-warmup learning rate; linear beta schedule
+  `1e-4 → 0.02`, T=1000).
 - **How it runs in the browser:** the trained weights — UNet + the word
   embedding table + the learned vocabulary — are embedded in this file
-  (`#pp-diffusion-model`, float32, base64, ~1.9 MB) and decoded on first
+  (`#pp-diffusion-model`, float32, base64, ~3.3 MB) and decoded on first
   use. Your prompt is tokenized and embedded by a JS port of the exact
   same rule (`promptToCaptionEmbedding`), then **DDIM sampling** (Steps
   slider, 1–20 denoising steps) runs fully client-side in plain JavaScript
@@ -149,16 +154,17 @@ from scratch** specifically to fit this 3 GB / iPad-9 target; there is also a
   + iterative refinement, the same paradigm as Stable Diffusion, vs. a direct
   coordinate→RGB field), and a real multi-step sampling loop instead of one
   forward pass.
-- **Honest limitation:** at 32×32 working resolution, ~469k parameters, and
-  only ~4.4k real training photos (vs. millions for an actual Stable Diffusion),
-  output is abstract/impressionistic — it picks up rough color palette and
-  mood from the prompt (e.g. warm tones for "sunset", blue-black for "night
-  sky", green for "forest") but not sharp recognizable objects. Real-world
-  photos are a much harder training target than the neural model's clean
-  analytic renders, and this is an honest, tiny, from-scratch model, not a
-  scaled one. It's offered alongside the neural model precisely so you can
-  see the difference between the two model families and the two training
-  data sources, side by side, both made from scratch, both fully local.
+- **Honest limitation:** at 32×32 working resolution, ~831k parameters, and
+  ~12.9k real training photos (vs. billions of images / billions of parameters
+  for an actual Stable Diffusion), output is abstract/impressionistic — it
+  picks up rough color palette and mood from the prompt (e.g. warm tones for
+  "sunset", blue-black for "night sky", green for "forest") but not sharp
+  recognizable objects. Real-world photos are a much harder training target
+  than the neural model's clean analytic renders, and this is an honest,
+  tiny, from-scratch model, not a scaled one. It's offered alongside the
+  neural model precisely so you can see the difference between the two
+  model families and the two training data sources, side by side, both
+  made from scratch, both fully local.
 
 ### B. ⚡ Procedural — WebGPU shader (broadest compatibility)
 - A hand-written **WebGPU** fragment shader (WGSL) with a **Canvas2D CPU fallback**:
@@ -307,8 +313,8 @@ python3 model/train.py          # ~19 min on CPU (8000 steps) → writes model_w
 - `model/previews.png` — sample outputs from the trained model.
 - `model/model.py` — the small conditional UNet architecture (PyTorch).
 - `model/scrape_dataset.py` — scrapes `model/dataset_real.db`, a real SQLite
-  database of photos + captions from the Wikimedia Commons API (115 search
-  topics, 4,389 rows, public-domain/freely-licensed only).
+  database of photos + captions from the Wikimedia Commons API (343 search
+  topics, 12,934 rows, public-domain/freely-licensed only).
 - `model/dataset_real.db` — the real training dataset itself (SQLite,
   queryable: image, caption, artist, license, source URL per row).
 - `model/train_diffusion.py` — trains the diffusion model + its own small
