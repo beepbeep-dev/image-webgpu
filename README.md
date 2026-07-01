@@ -312,11 +312,12 @@ python3 model/train.py          # ~19 min on CPU (8000 steps) → writes model_w
 - `model/model_web.json` — exported weights (also embedded in `index.html`).
 - `model/previews.png` — sample outputs from the trained model.
 - `model/model.py` — the small conditional UNet architecture (PyTorch).
-- `model/scrape_dataset.py` — scrapes `model/dataset_real.db`, a real SQLite
-  database of photos + captions from the Wikimedia Commons API (343 search
-  topics, 12,934 rows, public-domain/freely-licensed only).
-- `model/dataset_real.db` — the real training dataset itself (SQLite,
-  queryable: image, caption, artist, license, source URL per row).
+- `model/scrape_dataset.py` — scrapes `model/dataset_real.db` (run it to
+  regenerate), a real SQLite database of photos + captions from the
+  Wikimedia Commons API (485 search topics, public-domain/freely-licensed
+  only). **Not committed to the repo** — it's a large (~100+ MB), fully
+  regenerable build artifact, not something that belongs in source control;
+  only the script and the final trained weights are checked in.
 - `model/train_diffusion.py` — trains the diffusion model + its own small
   word-embedding text encoder from `model/dataset_real.db` (PyTorch, CPU)
   and exports `model/diffusion_model.json`.
