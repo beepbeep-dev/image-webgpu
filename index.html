@@ -1646,6 +1646,8 @@ async function runMyDiffusionEngine(prompt, seed, steps, size) {
   // learned from real scraped photo captions), not the hand-designed
   // category mapping the neural engine uses.
   const cond = promptToCaptionEmbedding(prompt);
+  const zeroCond = new Float32Array(cond.length);   // "unconditional" input, matches training's CFG dropout
+  const guidance = meta.guidanceScale || 1.0;
   const rng = mulberry32((hashString(prompt) ^ (seed >>> 0) ^ 0x9e3779b9) >>> 0);
   const randn = () => {
     let u = 0, v = 0;
@@ -1666,7 +1668,19 @@ async function runMyDiffusionEngine(prompt, seed, steps, size) {
   for (let i = 0; i < ts.length; i++) {
     const t = ts[i];
     const tNext = i + 1 < ts.length ? ts[i + 1] : -1;
-    const noisePred = unetForward(x, S, t / TRAIN_T, cond);
+    // Classifier-free guidance: extrapolate from the unconditional prediction
+    // toward the conditional one. Sharpens prompt adherence substantially for
+    // a model this small — trained for exactly this via caption dropout.
+    const t01 = t / TRAIN_T;
+    const noiseCond = unetForward(x, S, t01, cond);
+    let noisePred = noiseCond;
+    if (guidance !== 1.0) {
+      const noiseUncond = unetForward(x, S, t01, zeroCond);
+      noisePred = new Float32Array(noiseCond.length);
+      for (let k = 0; k < noisePred.length; k++) {
+        noisePred[k] = noiseUncond[k] + guidance * (noiseCond[k] - noiseUncond[k]);
+      }
+    }
     const alphaT = acp[t];
     const alphaPrev = tNext >= 0 ? acp[tNext] : 1.0;
     const sqrtAT = Math.sqrt(alphaT), sqrt1mAT = Math.sqrt(1 - alphaT);

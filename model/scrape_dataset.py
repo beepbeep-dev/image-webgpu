@@ -136,6 +136,68 @@ QUERIES = [
     "lotus flower pond", "tulip field colorful", "orchid flower closeup",
     "cactus garden desert", "moss covered rock", "ivy covered wall",
     "wildflower meadow", "pine cone closeup", "autumn pumpkin patch",
+
+    # --- landmarks / famous places ---
+    "eiffel tower paris", "great wall china", "taj mahal india",
+    "golden gate bridge", "grand canyon", "niagara falls", "mount everest",
+    "colosseum rome", "statue of liberty", "big ben london",
+    "sydney opera house", "machu picchu", "stonehenge", "petra jordan",
+    "santorini greece", "venice canal", "amsterdam canal houses",
+    "kyoto temple garden", "great barrier reef", "yellowstone geyser",
+    "mount fuji", "victoria falls", "angkor wat temple", "acropolis athens",
+    "burj khalifa dubai", "times square new york", "red square moscow",
+
+    # --- more everyday objects ---
+    "wall clock closeup", "wooden chair", "dining table set",
+    "table lamp closeup", "stack of books", "old key closeup",
+    "eyeglasses closeup", "wrist watch closeup", "leather backpack",
+    "pair of shoes", "straw hat", "bicycle helmet", "wooden door closeup",
+    "window with curtains", "vase of flowers", "wine bottle closeup",
+    "typewriter vintage", "old telephone", "sewing machine vintage",
+    "toolbox workshop", "paintbrush palette", "chess board pieces",
+    "playing cards table", "board game pieces", "puzzle pieces",
+
+    # --- more food ---
+    "sandwich plate", "donut closeup", "cupcake closeup", "cheese platter",
+    "grilled steak plate", "seafood platter", "noodles bowl asian",
+    "curry dish", "dumplings plate", "croissant bakery", "waffles breakfast",
+    "smoothie glass", "cocktail drink", "beer glass pub", "cheese wheel",
+    "honey jar closeup", "spices market closeup", "herbs garden closeup",
+
+    # --- more human activities / portraits ---
+    "chef cooking kitchen", "doctor hospital", "teacher classroom",
+    "firefighter action", "construction worker site", "artist painting canvas",
+    "musician playing stage", "photographer camera", "scientist lab coat",
+    "farmer harvesting field", "baker bakery kitchen", "carpenter workshop",
+    "student studying library", "business meeting office",
+    "family picnic park", "friends laughing outdoors", "couple walking beach",
+    "grandmother knitting", "baby sleeping crib", "children playing playground",
+
+    # --- celebrations / holidays ---
+    "christmas tree lights", "halloween pumpkin carving", "birthday party cake",
+    "wedding ceremony flowers", "new year fireworks", "easter eggs basket",
+    "thanksgiving dinner table", "carnival parade costumes", "diwali lights festival",
+    "graduation ceremony cap",
+
+    # --- more nature macro / wildlife ---
+    "leaf closeup veins", "tree bark texture", "rock texture closeup",
+    "sand dune texture closeup", "water droplets leaf", "spider macro closeup",
+    "beetle macro closeup", "grasshopper macro closeup", "moth closeup wings",
+    "coral reef closeup", "seashell beach closeup", "pebbles beach closeup",
+    "bird nest closeup", "bird eggs closeup", "feather closeup macro",
+    "owl closeup portrait", "wolf closeup portrait", "fox closeup portrait",
+    "eagle closeup portrait", "tiger closeup portrait", "lion closeup portrait",
+
+    # --- more transportation / tech ---
+    "container ship port", "cargo plane airport", "high speed train",
+    "electric car charging", "solar panels field", "wind turbines field",
+    "oil rig ocean", "power plant industrial", "bridge suspension night",
+    "highway traffic night", "airport terminal interior", "subway tunnel",
+
+    # --- more weather / sky ---
+    "cloudy sky dramatic", "clear blue sky", "sunset clouds orange",
+    "hazy sky city", "double rainbow field", "meteor shower night sky",
+    "sunbeams forest", "golden hour field", "blue hour city",
 ]
 
 
@@ -230,20 +292,17 @@ def main():
         CREATE INDEX IF NOT EXISTS idx_query ON samples(query);
     """)
 
-    done_queries = set()
     seen_pageids = set()
     if resume:
-        done_queries = {r[0] for r in cur.execute("SELECT DISTINCT query FROM samples")}
         seen_pageids = {r[0] for r in cur.execute("SELECT page_id FROM samples")}
-        print(f"resuming: {len(done_queries)} queries already done, {len(seen_pageids)} rows so far")
+        print(f"resuming: {len(seen_pageids)} rows already saved (all {len(QUERIES)} queries will be "
+              f"re-run with a higher per-query limit so already-scraped topics get topped up with new results too)")
     total_saved = len(seen_pageids)
     t0 = time.time()
     for qi, q in enumerate(QUERIES):
-        if q in done_queries:
-            continue
         data = api_get({
             "action": "query", "generator": "search", "gsrsearch": q,
-            "gsrlimit": 40, "gsrnamespace": 6,
+            "gsrlimit": 90, "gsrnamespace": 6,
             "prop": "imageinfo", "iiprop": "url|extmetadata|size",
             "iiurlwidth": THUMB_W,
         })

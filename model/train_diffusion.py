@@ -11,6 +11,18 @@ a tiny trainable word-embedding table (built from the dataset's own
 vocabulary) maps each caption to a fixed-size vector by mean-pooling the
 embeddings of its known words — essentially a minimal from-scratch text
 encoder, trained jointly with the UNet on the actual diffusion objective.
+
+Two standard quality tricks used by real diffusion models are applied here
+too (both are cheap and well-established, not experimental):
+  - EMA (exponential moving average) of the weights during training — the
+    shadow-averaged weights are what get exported/shipped, since raw SGD/Adam
+    weights are noisier and produce visibly grainier samples.
+  - Classifier-free guidance (CFG): captions are randomly dropped during
+    training (replaced with a zero vector) so the model also learns the
+    *unconditional* denoising distribution; at sampling time the JS side
+    extrapolates away from the unconditional prediction toward the
+    conditional one, which sharpens prompt adherence substantially for a
+    model this small.
 """
 import io, json, re, sqlite3, time
 import numpy as np
@@ -110,16 +122,23 @@ class CaptionEncoder(nn.Module):
 
 
 device = "cpu"
-model = TinyUNet(c0=36, c1=58, c2=84, emb_dim=128, cdim=EMBED_DIM).to(device)
+C0, C1, C2, EMB_DIM = 36, 58, 84, 128
+model = TinyUNet(c0=C0, c1=C1, c2=C2, emb_dim=EMB_DIM, cdim=EMBED_DIM).to(device)
 cap_enc = CaptionEncoder(len(vocab), EMBED_DIM).to(device)
 print("UNet params:", model.param_count(), " caption encoder params:",
       sum(p.numel() for p in cap_enc.parameters()))
 
 LR = 1e-3
 WARMUP = 300
+UNCOND_P = 0.15         # classifier-free-guidance caption dropout rate
+GUIDANCE_SCALE = 3.0    # used at sampling time (baked into meta for the JS side)
+EMA_DECAY = 0.999
 opt = torch.optim.Adam(list(model.parameters()) + list(cap_enc.parameters()), lr=LR)
 
-STEPS = 12000
+all_params = list(model.named_parameters()) + [("word_emb." + k, v) for k, v in cap_enc.embed.named_parameters()]
+ema = {name: p.detach().clone() for name, p in all_params}
+
+STEPS = 16000
 BATCH = 64
 t0 = time.time()
 ema_loss = None
@@ -134,11 +153,17 @@ for step in range(1, STEPS + 1):
 
     opt.zero_grad()
     cond = cap_enc(ids_b, mask_b)
+    uncond_mask = (torch.rand(BATCH, 1) < UNCOND_P).float()
+    cond = cond * (1.0 - uncond_mask)   # classifier-free-guidance dropout
     pred = model(xt, t_idx.float() / T, cond)
     loss = F.mse_loss(pred, noise)
     loss.backward()
     torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(cap_enc.parameters()), 1.0)
     opt.step()
+
+    with torch.no_grad():
+        for name, p in all_params:
+            ema[name].mul_(EMA_DECAY).add_(p.detach(), alpha=1.0 - EMA_DECAY)
 
     ema_loss = loss.item() if ema_loss is None else 0.98 * ema_loss + 0.02 * loss.item()
     if step % 200 == 0 or step == 1:
@@ -147,15 +172,14 @@ for step in range(1, STEPS + 1):
 print("trained in %.1fs" % (time.time() - t0))
 
 # ---------------------------------------------------------------------------
-# Export: UNet weights + the caption word-embedding table, as one flat
+# Export: EMA'd UNet weights + the caption word-embedding table, as one flat
 # float32 array (base64 in the web app), plus the noise schedule constants
 # and vocabulary needed to reproduce DDIM sampling + tokenization in JS.
 # ---------------------------------------------------------------------------
 order = []
 shapes = {}
 flat = []
-sd = dict(model.state_dict())
-sd["word_emb.weight"] = cap_enc.embed.weight.detach()
+sd = dict(ema)
 for k, v in sd.items():
     order.append(k)
     shapes[k] = list(v.shape)
@@ -168,8 +192,8 @@ b64 = base64.b64encode(flat.tobytes()).decode("ascii")
 
 meta = {
     "S": S, "T": T, "betaStart": BETA_START, "betaEnd": BETA_END,
-    "c0": 36, "c1": 58, "c2": 84, "embDim": 128, "cdim": EMBED_DIM,
-    "vocab": vocab,
+    "c0": C0, "c1": C1, "c2": C2, "embDim": EMB_DIM, "cdim": EMBED_DIM,
+    "vocab": vocab, "guidanceScale": GUIDANCE_SCALE,
 }
 out = {"meta": meta, "order": order, "shapes": shapes, "b64": b64}
 with open("diffusion_model.json", "w") as f:

@@ -6,3 +6,4 @@ model/train_real.log
 model/dataset_real.db-journal
 model/scrape_full.log
 model/train_full.log
+model/scrape_v2.log
