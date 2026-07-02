@@ -119,13 +119,14 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 use_amp = device == "cuda"   # bf16 autocast on GPU: ~2x+ speedup, no loss-scaler needed (Ampere/Ada+)
 print("device:", device, " mixed precision:", use_amp)
 
-# ~21M params — sized to actually fit our real dataset (~6.7k images). The
-# first attempt at 109M params badly overfit/undertrained on this little
-# data (visibly blotchy/painterly output, unaffected by sampling params like
-# guidance scale or step count — confirmed the problem was baked into the
-# weights, not a sampling issue), so this is a deliberately smaller
-# architecture matched to what we actually scraped, not the ~100k-image
-# target we didn't reach.
+# ~21M params, sized for our real dataset (~6.7k images). Two prior runs
+# (109M @ 12k steps, then this same 21M arch @ 12k steps) both produced
+# pure noise-like output with no spatial structure; checking the sampled
+# output's pixel std against real training images (~1.0 vs ~0.48) showed
+# the model wasn't undertrained due to capacity, it just hadn't had nearly
+# enough optimization steps yet — 256x256 has 64x the pixels of the 32x32
+# model that trains fine in a comparable step count, so it needs
+# proportionally more steps to converge, not a smaller/bigger network.
 CHANNELS = (64, 96, 144, 216, 320, 448)
 EMB_DIM = 192
 model = BigUNet(channels=CHANNELS, emb_dim=EMB_DIM, cdim=EMBED_DIM).to(device)
@@ -143,7 +144,7 @@ opt = torch.optim.Adam(list(model.parameters()) + list(cap_enc.parameters()), lr
 all_params = list(model.named_parameters()) + [("word_emb." + k, v) for k, v in cap_enc.embed.named_parameters()]
 ema = {name: p.detach().clone() for name, p in all_params}
 
-STEPS = 12000
+STEPS = 60000   # ~5x more than the first two (undertrained) attempts
 BATCH = 32 if device == "cuda" else 8   # smaller model than before, more VRAM headroom
 
 # Background prefetch: decode the NEXT batch's images on a worker thread
@@ -162,6 +163,34 @@ threading.Thread(target=_producer, daemon=True).start()
 
 sqrt_acp_d = sqrt_acp.to(device)
 sqrt_1m_acp_d = sqrt_1m_acp.to(device)
+
+import base64
+
+
+def export_model():
+    """Flat float32 + base64 export (same format as the 32x32 model). Called
+    periodically during training too, not just at the end, so a checkpoint
+    is always on disk for the onstart script to upload — a long run like
+    this one has more chances to be interrupted than the earlier short
+    ones, and losing an in-progress checkpoint would waste real GPU money."""
+    order, shapes, flat = [], {}, []
+    for k, v in ema.items():
+        order.append(k)
+        shapes[k] = list(v.shape)
+        flat.append(v.detach().cpu().numpy().astype(np.float32).ravel())
+    flat = np.concatenate(flat)
+    b64 = base64.b64encode(flat.tobytes()).decode("ascii")
+    meta = {
+        "S": S, "T": T, "betaStart": BETA_START, "betaEnd": BETA_END,
+        "channels": list(CHANNELS), "embDim": EMB_DIM, "cdim": EMBED_DIM,
+        "vocab": vocab, "guidanceScale": GUIDANCE_SCALE,
+    }
+    out = {"meta": meta, "order": order, "shapes": shapes, "b64": b64}
+    tmp_path = "diffusion_hq_model.json.tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(out, f)
+    os.replace(tmp_path, "diffusion_hq_model.json")   # atomic, so the upload loop never reads a half-written file
+
 
 t0 = time.time()
 ema_loss = None
@@ -195,32 +224,10 @@ for step in range(1, STEPS + 1):
     ema_loss = loss.item() if ema_loss is None else 0.98 * ema_loss + 0.02 * loss.item()
     if step % 50 == 0 or step == 1:
         print(f"step {step:5d}  loss {loss.item():.4f}  ema {ema_loss:.4f}  ({time.time()-t0:7.1f}s)")
+    if step % 10000 == 0:
+        export_model()
+        print(f"checkpoint saved at step {step}")
 
 print("trained in %.1fs" % (time.time() - t0))
-
-# ---------------------------------------------------------------------------
-# Export (same flat float32 + base64 format as the 32x32 model).
-# ---------------------------------------------------------------------------
-order = []
-shapes = {}
-flat = []
-sd = dict(ema)
-for k, v in sd.items():
-    order.append(k)
-    shapes[k] = list(v.shape)
-    flat.append(v.detach().cpu().numpy().astype(np.float32).ravel())
-flat = np.concatenate(flat)
-print("total params exported:", flat.size, " raw bytes:", flat.nbytes)
-
-import base64
-b64 = base64.b64encode(flat.tobytes()).decode("ascii")
-
-meta = {
-    "S": S, "T": T, "betaStart": BETA_START, "betaEnd": BETA_END,
-    "channels": list(CHANNELS), "embDim": EMB_DIM, "cdim": EMBED_DIM,
-    "vocab": vocab, "guidanceScale": GUIDANCE_SCALE,
-}
-out = {"meta": meta, "order": order, "shapes": shapes, "b64": b64}
-with open("diffusion_hq_model.json", "w") as f:
-    json.dump(out, f)
-print("saved diffusion_hq_model.json, b64 len:", len(b64))
+export_model()
+print("saved diffusion_hq_model.json")
