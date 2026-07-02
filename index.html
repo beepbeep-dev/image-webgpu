@@ -1833,6 +1833,36 @@ let HQ_MODEL = null;      // { meta, raw: {name: Float32Array} }
 let HQ_PIPELINES = null;  // { conv2d, silu, filmSilu, add, upsample } GPUComputePipelines
 let HQ_GPU_T = null;      // { name: GPUBuffer } — conv/pool/upsample weights, uploaded once
 
+// The trained HQ model's x0 (clean-image) prediction runs at roughly 2x the
+// variance real training photos actually have in this [-1,1] normalized
+// space (measured: ~0.48 for real photos vs ~1.1-1.2 out of the model,
+// consistently, regardless of guidance scale or step count) — a
+// calibration property baked into the trained weights, not a sampling bug.
+// Left alone, that pushes DDIM's intermediate values far outside [-1,1],
+// which the final [-1,1]→[0,1] clip turns into harsh, blown-out, static-
+// looking blotches. Rescaling x0 back toward the real data's variance at
+// each step (the same idea as "dynamic thresholding" in other diffusion
+// implementations) fixes this with the exact same weights — no retraining.
+const HQ_X0_TARGET_STD = 0.48;
+function hqDdimStep(x, noisePred, alphaT, alphaPrev, n) {
+  const sqrtAT = Math.sqrt(alphaT), sqrt1mAT = Math.sqrt(1 - alphaT);
+  const sqrtAP = Math.sqrt(alphaPrev), sqrt1mAP = Math.sqrt(1 - alphaPrev);
+  const x0 = new Float32Array(n);
+  let sumSq = 0;
+  for (let k = 0; k < n; k++) {
+    const v = (x[k] - sqrt1mAT * noisePred[k]) / sqrtAT;
+    x0[k] = v;
+    sumSq += v * v;
+  }
+  const std = Math.sqrt(sumSq / n);
+  const scale = std > HQ_X0_TARGET_STD ? HQ_X0_TARGET_STD / std : 1;
+  for (let k = 0; k < n; k++) {
+    let v = x0[k] * scale;
+    if (v > 1.2) v = 1.2; else if (v < -1.2) v = -1.2;
+    x[k] = sqrtAP * v + sqrt1mAP * noisePred[k];
+  }
+}
+
 // This model (~109M params, ~560MB as JSON) is far too large to embed inline
 // like the other two from-scratch models, so — same idea as the ONNX
 // Diffusion engine's SD-Turbo download — it's fetched on demand from a
@@ -2164,14 +2194,7 @@ async function runHQDiffusionEngine(prompt, seed, steps, size) {
       noisePred = new Float32Array(noiseCond.length);
       for (let k = 0; k < noisePred.length; k++) noisePred[k] = noiseUncond[k] + guidance * (noiseCond[k] - noiseUncond[k]);
     }
-    const alphaT = acp[t];
-    const alphaPrev = tNext >= 0 ? acp[tNext] : 1.0;
-    const sqrtAT = Math.sqrt(alphaT), sqrt1mAT = Math.sqrt(1 - alphaT);
-    const sqrtAP = Math.sqrt(alphaPrev), sqrt1mAP = Math.sqrt(1 - alphaPrev);
-    for (let k = 0; k < n; k++) {
-      const x0 = (x[k] - sqrt1mAT * noisePred[k]) / sqrtAT;
-      x[k] = sqrtAP * x0 + sqrt1mAP * noisePred[k];
-    }
+    hqDdimStep(x, noisePred, acp[t], tNext >= 0 ? acp[tNext] : 1.0, n);
     setProgress(0.5 + (i + 1) / ts.length * 0.5);
     await new Promise(r => setTimeout(r, 0));
   }
@@ -2474,14 +2497,7 @@ async function runHQDiffusionEngineCPU(prompt, seed, steps, size) {
     const passMs = (performance.now() - passT0) / passesPerStep;
     avgPassMs = avgPassMs === null ? passMs : 0.5 * avgPassMs + 0.5 * passMs;
 
-    const alphaT = acp[t];
-    const alphaPrev = tNext >= 0 ? acp[tNext] : 1.0;
-    const sqrtAT = Math.sqrt(alphaT), sqrt1mAT = Math.sqrt(1 - alphaT);
-    const sqrtAP = Math.sqrt(alphaPrev), sqrt1mAP = Math.sqrt(1 - alphaPrev);
-    for (let k = 0; k < n; k++) {
-      const x0 = (x[k] - sqrt1mAT * noisePred[k]) / sqrtAT;
-      x[k] = sqrtAP * x0 + sqrt1mAP * noisePred[k];
-    }
+    hqDdimStep(x, noisePred, acp[t], tNext >= 0 ? acp[tNext] : 1.0, n);
   }
 
   paintTensorToCanvas({ dims: [1, 3, S, S], data: x }, size);
