@@ -2114,7 +2114,7 @@ async function runHQDiffusionEngine(prompt, seed, steps, size) {
   const device = await getWebGPUDevice();
   if (!device) {
     setStatus("Diffusion HQ needs WebGPU, which isn't available here — falling back to the neural model.", "err");
-    await runNeuralEngine(prompt, seed, size);
+    await runNeuralEngine(prompt, seed, steps, size);
     return;
   }
   if (!HQ_MODEL) setStatus("Downloading our HQ diffusion model (~560 MB, one-time)…", "work");
