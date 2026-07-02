@@ -154,7 +154,12 @@ opt = torch.optim.Adam(list(model.parameters()) + list(cap_enc.parameters()), lr
 all_params = list(model.named_parameters()) + [("word_emb." + k, v) for k, v in cap_enc.embed.named_parameters()]
 ema = {name: p.detach().clone() for name, p in all_params}
 
-STEPS = 60000   # ~5x more than the first two (undertrained) attempts
+STEPS = 100000  # bigger dataset (7.6k imgs + flip/jitter augmentation) and a
+                # deeper architecture (self-attention at 16x16/8x8) than the
+                # 60k-step run this follows, which already showed a real
+                # jump from pure noise to structured (if still abstract)
+                # output — checkpointed every 5k steps below so a shorter
+                # partial run still yields a usable, improving model.
 BATCH = 32 if device == "cuda" else 8   # smaller model than before, more VRAM headroom
 
 # Background prefetch: decode the NEXT batch's images on a worker thread
@@ -234,7 +239,7 @@ for step in range(1, STEPS + 1):
     ema_loss = loss.item() if ema_loss is None else 0.98 * ema_loss + 0.02 * loss.item()
     if step % 50 == 0 or step == 1:
         print(f"step {step:5d}  loss {loss.item():.4f}  ema {ema_loss:.4f}  ({time.time()-t0:7.1f}s)")
-    if step % 10000 == 0:
+    if step % 5000 == 0:
         export_model()
         print(f"checkpoint saved at step {step}")
 
