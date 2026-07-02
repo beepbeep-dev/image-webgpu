@@ -1858,7 +1858,22 @@ async function loadHQModelWeights(onProgress) {
       return buf;
     })()
   );
-  const m = JSON.parse(text);
+
+  // The download is a single big streamed fetch, so a flaky connection (or
+  // the file changing server-side mid-download) can hand us truncated or
+  // inconsistent bytes. A corrupt payload here used to surface as a cryptic
+  // browser exception deep inside GPU/canvas code (e.g. a canvas IndexSizeError
+  // from a garbage width/height) — validate up front instead, with a clear,
+  // retryable error message, and don't cache a bad result.
+  let m;
+  try {
+    m = JSON.parse(text);
+  } catch (e) {
+    throw new Error("Downloaded Diffusion HQ model is corrupted or incomplete (bad JSON) — please try generating again.");
+  }
+  if (!m || !m.meta || !Number.isInteger(m.meta.S) || m.meta.S < 8 || m.meta.S > 2048) {
+    throw new Error("Downloaded Diffusion HQ model is corrupted or incomplete (bad metadata) — please try generating again.");
+  }
   const bin = atob(m.b64);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
@@ -1867,6 +1882,9 @@ async function loadHQModelWeights(onProgress) {
   for (const k of m.order) {
     const n = m.shapes[k].reduce((a, b) => a * b, 1);
     raw[k] = f32.slice(off, off + n); off += n;
+  }
+  if (off !== f32.length) {
+    throw new Error("Downloaded Diffusion HQ model is corrupted or incomplete (size mismatch) — please try generating again.");
   }
   HQ_MODEL = { meta: m.meta, raw };
   return HQ_MODEL;
