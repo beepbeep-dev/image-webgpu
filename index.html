@@ -214,20 +214,24 @@
         <button data-engine="neural" class="active">🧬 Neural model</button>
         <button data-engine="mydiffusion">🌀 Diffusion (ours)</button>
         <button data-engine="hqdiffusion">🎨 Diffusion HQ (ours)</button>
+        <button data-engine="hqcpu">🐌 Diffusion HQ (CPU)</button>
         <button data-engine="local">⚡ Procedural</button>
         <button data-engine="diffusion">🧠 Diffusion (ONNX)</button>
       </div>
-      <p class="note" style="margin-top:4px">🧬/🌀/🎨 are all <b>ours</b> — trained
+      <p class="note" style="margin-top:4px">🧬/🌀/🎨/🐌 are all <b>ours</b> — trained
       from scratch by us, not fine-tuned from someone else's model. 🧬 is a
       conditional neural field (instant, very smooth, fully embedded, zero
       downloads). 🌀 is a small diffusion model (conditional UNet, iterative
       denoising, also fully embedded) — slower but a genuine noise→image
-      generative process. 🎨 is a bigger (~109M-parameter), deeper diffusion
-      model generating natively at 256×256 — too large to embed, so it
-      downloads once (~560 MB, cached by the browser after) from Hugging
-      Face and needs real WebGPU for its conv-shader inference to run at a
-      usable speed. ⚡ is a non-learned procedural renderer. 🧠 downloads a
-      real pretrained Stable-Diffusion-class model (see setup panel below).</p>
+      generative process. 🎨/🐌 are the same bigger (~21M-parameter), deeper
+      diffusion model generating natively at 256×256, trained on ~6,700 real
+      photos — too large to embed, so it downloads once (~110 MB, cached by
+      the browser after) from Hugging Face. 🎨 runs its conv-shader inference
+      on real WebGPU (fast); 🐌 runs the identical model as plain JS on the
+      CPU for browsers without WebGPU — genuinely slow (minutes per image,
+      capped at 6 steps), but works everywhere. ⚡ is a non-learned
+      procedural renderer. 🧠 downloads a real pretrained
+      Stable-Diffusion-class model (see setup panel below).</p>
 
       <div class="row">
         <div>
@@ -2178,6 +2182,314 @@ async function runHQDiffusionEngine(prompt, seed, steps, size) {
 }
 
 /* =====================================================================
+   D4. DIFFUSION HQ — CPU FALLBACK MODE
+   Same BigUNet (model_hq.py), same trained weights, same DDIM sampling —
+   but with every op run as a plain JS loop instead of a WebGPU compute
+   shader, for people whose browser/device doesn't have WebGPU at all. This
+   is genuinely slow (a single forward pass is ~35 GMAC; even the fastest
+   loop ordering we could get out of plain JS runs well under 2 GFLOP/s, so
+   one pass takes on the order of a minute) — it's an explicit opt-in engine
+   rather than an automatic fallback, with steps capped low and a live
+   time estimate, so nobody hits this by surprise.
+   ===================================================================== */
+let _hqCpuLastYield = 0;
+async function hqMaybeYieldCPU() {
+  const now = performance.now();
+  if (now - _hqCpuLastYield > 80) {
+    _hqCpuLastYield = now;
+    await new Promise(r => setTimeout(r, 0));
+  }
+}
+
+// General conv2d (any stride/pad) with a fast interior path for the common
+// stride=1/pad=1/same-size case (the vast majority of the UNet's compute),
+// falling back to a per-pixel bounds-checked loop for the stride=2 pool
+// convs and the border pixels of the fast path.
+function hqConv2dCPU(input, inC, inH, inW, weight, bias, outC, stride, pad) {
+  const outH = Math.floor((inH + 2 * pad - 3) / stride) + 1;
+  const outW = Math.floor((inW + 2 * pad - 3) / stride) + 1;
+  const output = new Float32Array(outC * outH * outW);
+
+  function borderPixel(oc, oy, ox, wBase, inBase) {
+    let sum = 0;
+    for (let ky = 0; ky < 3; ky++) {
+      const iy = oy - pad + ky;
+      if (iy < 0 || iy >= inH) continue;
+      for (let kx = 0; kx < 3; kx++) {
+        const ix = ox - pad + kx;
+        if (ix < 0 || ix >= inW) continue;
+        sum += input[inBase + iy * inW + ix] * weight[wBase + ky * 3 + kx];
+      }
+    }
+    return sum;
+  }
+
+  if (stride === 1 && pad === 1 && outH === inH && outW === inW) {
+    for (let oc = 0; oc < outC; oc++) {
+      const outBaseOc = oc * outH * outW;
+      const b = bias[oc];
+      output.fill(b, outBaseOc, outBaseOc + outH * outW);
+      for (let ic = 0; ic < inC; ic++) {
+        const inBase = ic * inH * inW;
+        const wBase = (oc * inC + ic) * 9;
+        const w00 = weight[wBase], w01 = weight[wBase + 1], w02 = weight[wBase + 2];
+        const w10 = weight[wBase + 3], w11 = weight[wBase + 4], w12 = weight[wBase + 5];
+        const w20 = weight[wBase + 6], w21 = weight[wBase + 7], w22 = weight[wBase + 8];
+        for (let oy = 1; oy < outH - 1; oy++) {
+          const inRowM1 = inBase + (oy - 1) * inW, inRow0 = inBase + oy * inW, inRowP1 = inBase + (oy + 1) * inW;
+          const outRow = outBaseOc + oy * outW;
+          for (let ox = 1; ox < outW - 1; ox++) {
+            output[outRow + ox] +=
+                input[inRowM1 + ox - 1] * w00 + input[inRowM1 + ox] * w01 + input[inRowM1 + ox + 1] * w02
+              + input[inRow0 + ox - 1] * w10  + input[inRow0 + ox] * w11  + input[inRow0 + ox + 1] * w12
+              + input[inRowP1 + ox - 1] * w20 + input[inRowP1 + ox] * w21 + input[inRowP1 + ox + 1] * w22;
+          }
+        }
+        for (const oy of [0, outH - 1]) {
+          const outRow = outBaseOc + oy * outW;
+          for (let ox = 0; ox < outW; ox++) output[outRow + ox] += borderPixel(oc, oy, ox, wBase, inBase);
+        }
+        for (let oy = 1; oy < outH - 1; oy++) {
+          const outRow = outBaseOc + oy * outW;
+          for (const ox of [0, outW - 1]) output[outRow + ox] += borderPixel(oc, oy, ox, wBase, inBase);
+        }
+      }
+    }
+  } else {
+    for (let oc = 0; oc < outC; oc++) {
+      const wBaseOc = oc * inC * 9, outBaseOc = oc * outH * outW, b = bias[oc];
+      for (let oy = 0; oy < outH; oy++) {
+        const iy0 = oy * stride - pad;
+        const outRow = outBaseOc + oy * outW;
+        for (let ox = 0; ox < outW; ox++) {
+          const ix0 = ox * stride - pad;
+          let sum = b;
+          for (let ic = 0; ic < inC; ic++) {
+            const inBase = ic * inH * inW, wBase = wBaseOc + ic * 9;
+            for (let ky = 0; ky < 3; ky++) {
+              const iy = iy0 + ky;
+              if (iy < 0 || iy >= inH) continue;
+              const inRow = inBase + iy * inW, wRow = wBase + ky * 3;
+              for (let kx = 0; kx < 3; kx++) {
+                const ix = ix0 + kx;
+                if (ix < 0 || ix >= inW) continue;
+                sum += input[inRow + ix] * weight[wRow + kx];
+              }
+            }
+          }
+          output[outRow + ox] = sum;
+        }
+      }
+    }
+  }
+  return { data: output, C: outC, H: outH, W: outW };
+}
+function hqSiluCPU(data) {
+  for (let i = 0; i < data.length; i++) { const v = data[i]; data[i] = v / (1 + Math.exp(-v)); }
+}
+function hqFilmSiluCPU(data, C, HW, film) {
+  for (let c = 0; c < C; c++) {
+    const scale = 1 + film[c], shift = film[C + c], base = c * HW;
+    for (let i = 0; i < HW; i++) { const v = data[base + i] * scale + shift; data[base + i] = v / (1 + Math.exp(-v)); }
+  }
+}
+function hqAddCPU(a, b) { for (let i = 0; i < a.length; i++) a[i] += b[i]; }
+function hqUpsample2xCPU(input, C, H, W) {
+  const outH = H * 2, outW = W * 2;
+  const output = new Float32Array(C * outH * outW);
+  for (let c = 0; c < C; c++) {
+    const inBase = c * H * W, outBase = c * outH * outW;
+    for (let y = 0; y < H; y++) {
+      const inRow = inBase + y * W, outRow0 = outBase + (y * 2) * outW, outRow1 = outBase + (y * 2 + 1) * outW;
+      for (let x = 0; x < W; x++) {
+        const v = input[inRow + x], ox = x * 2;
+        output[outRow0 + ox] = v; output[outRow0 + ox + 1] = v;
+        output[outRow1 + ox] = v; output[outRow1 + ox + 1] = v;
+      }
+    }
+  }
+  return { data: output, C, H: outH, W: outW };
+}
+function hqConcatChannelsCPU(a, b) {
+  const C = a.C + b.C, H = a.H, W = a.W;
+  const output = new Float32Array(C * H * W);
+  output.set(a.data, 0);
+  output.set(b.data, a.C * H * W);
+  return { data: output, C, H, W };
+}
+
+// Mirrors hqUnetForward (the WebGPU version) op-for-op, just on plain JS
+// typed arrays. Yields periodically (hqMaybeYieldCPU) so the tab stays
+// responsive and progress can be shown during a pass.
+async function hqUnetForwardCPU(raw, meta, xData, t01, cond, onProgress) {
+  const S = meta.S;
+  const [c0, c1, c2, c3, c4, c5] = meta.channels;
+  const embDim = meta.embDim;
+
+  const temb = linearFwd(silu2(linearFwd(sinusoidalEmbedding(t01, embDim), raw["t_mlp.0.weight"], raw["t_mlp.0.bias"], embDim, embDim)),
+    raw["t_mlp.2.weight"], raw["t_mlp.2.bias"], embDim, embDim);
+  const cemb = linearFwd(silu2(linearFwd(cond, raw["c_mlp.0.weight"], raw["c_mlp.0.bias"], meta.cdim, embDim)),
+    raw["c_mlp.2.weight"], raw["c_mlp.2.bias"], embDim, embDim);
+  const emb = new Float32Array(embDim);
+  for (let i = 0; i < embDim; i++) emb[i] = temb[i] + cemb[i];
+
+  const TOTAL_OPS = 36; // total conv2d calls below, for a rough progress readout
+  let opsDone = 0;
+  async function conv(x, weight, bias, outC, stride, pad) {
+    const r = hqConv2dCPU(x.data, x.C, x.H, x.W, weight, bias, outC, stride, pad);
+    opsDone++;
+    if (onProgress) onProgress(opsDone / TOTAL_OPS);
+    await hqMaybeYieldCPU();
+    return r;
+  }
+  function filmFor(prefix, C) {
+    return linearFwd(emb, raw[`${prefix}.film.weight`], raw[`${prefix}.film.bias`], embDim, 2 * C);
+  }
+  async function resBlock(x, prefix, C) {
+    let h = await conv(x, raw[`${prefix}.conv1.weight`], raw[`${prefix}.conv1.bias`], C, 1, 1);
+    hqSiluCPU(h.data);
+    hqFilmSiluCPU(h.data, C, h.H * h.W, filmFor(prefix, C));
+    const h2 = await conv(h, raw[`${prefix}.conv2.weight`], raw[`${prefix}.conv2.bias`], C, 1, 1);
+    hqAddCPU(h2.data, x.data);
+    return h2;
+  }
+
+  let h0 = { data: xData, C: 3, H: S, W: S };
+  h0 = await conv(h0, raw["stem.weight"], raw["stem.bias"], c0, 1, 1);
+  hqSiluCPU(h0.data);
+  h0 = await resBlock(h0, "down0", c0);
+
+  let h1 = await conv(h0, raw["pool0.weight"], raw["pool0.bias"], c1, 2, 1);
+  hqSiluCPU(h1.data);
+  h1 = await resBlock(h1, "down1", c1);
+
+  let h2 = await conv(h1, raw["pool1.weight"], raw["pool1.bias"], c2, 2, 1);
+  hqSiluCPU(h2.data);
+  h2 = await resBlock(h2, "down2", c2);
+
+  let h3 = await conv(h2, raw["pool2.weight"], raw["pool2.bias"], c3, 2, 1);
+  hqSiluCPU(h3.data);
+  h3 = await resBlock(h3, "down3", c3);
+
+  let h4 = await conv(h3, raw["pool3.weight"], raw["pool3.bias"], c4, 2, 1);
+  hqSiluCPU(h4.data);
+  h4 = await resBlock(h4, "down4", c4);
+
+  let h5 = await conv(h4, raw["pool4.weight"], raw["pool4.bias"], c5, 2, 1);
+  hqSiluCPU(h5.data);
+  h5 = await resBlock(h5, "mid1", c5);
+  h5 = await resBlock(h5, "mid2", c5);
+
+  let u4 = hqUpsample2xCPU(h5.data, h5.C, h5.H, h5.W);
+  u4 = hqConcatChannelsCPU(u4, h4);
+  u4 = await conv(u4, raw["up4_conv.weight"], raw["up4_conv.bias"], c4, 1, 1);
+  hqSiluCPU(u4.data);
+  u4 = await resBlock(u4, "up4", c4);
+
+  let u3 = hqUpsample2xCPU(u4.data, u4.C, u4.H, u4.W);
+  u3 = hqConcatChannelsCPU(u3, h3);
+  u3 = await conv(u3, raw["up3_conv.weight"], raw["up3_conv.bias"], c3, 1, 1);
+  hqSiluCPU(u3.data);
+  u3 = await resBlock(u3, "up3", c3);
+
+  let u2 = hqUpsample2xCPU(u3.data, u3.C, u3.H, u3.W);
+  u2 = hqConcatChannelsCPU(u2, h2);
+  u2 = await conv(u2, raw["up2_conv.weight"], raw["up2_conv.bias"], c2, 1, 1);
+  hqSiluCPU(u2.data);
+  u2 = await resBlock(u2, "up2", c2);
+
+  let u1 = hqUpsample2xCPU(u2.data, u2.C, u2.H, u2.W);
+  u1 = hqConcatChannelsCPU(u1, h1);
+  u1 = await conv(u1, raw["up1_conv.weight"], raw["up1_conv.bias"], c1, 1, 1);
+  hqSiluCPU(u1.data);
+  u1 = await resBlock(u1, "up1", c1);
+
+  let u0 = hqUpsample2xCPU(u1.data, u1.C, u1.H, u1.W);
+  u0 = hqConcatChannelsCPU(u0, h0);
+  u0 = await conv(u0, raw["up0_conv.weight"], raw["up0_conv.bias"], c0, 1, 1);
+  hqSiluCPU(u0.data);
+  u0 = await resBlock(u0, "up0", c0);
+
+  const head = await conv(u0, raw["head.weight"], raw["head.bias"], 3, 1, 1);
+  return head.data;
+}
+
+async function runHQDiffusionEngineCPU(prompt, seed, steps, size) {
+  if (!HQ_MODEL) setStatus("Downloading our HQ diffusion model (~560 MB, one-time)…", "work");
+  const { meta, raw } = await loadHQModelWeights((frac) => setProgress(frac * 0.1));
+  const { S, T: TRAIN_T, betaStart, betaEnd } = meta;
+
+  const betas = new Float32Array(TRAIN_T);
+  for (let i = 0; i < TRAIN_T; i++) betas[i] = betaStart + (betaEnd - betaStart) * i / (TRAIN_T - 1);
+  const acp = new Float64Array(TRAIN_T);
+  let cum = 1;
+  for (let i = 0; i < TRAIN_T; i++) { cum *= (1 - betas[i]); acp[i] = cum; }
+
+  const cond = hqPromptToCaptionEmbedding(prompt, meta, raw);
+  const zeroCond = new Float32Array(cond.length);
+  const guidance = meta.guidanceScale || 1.0;
+  const rng = mulberry32((hashString(prompt) ^ (seed >>> 0) ^ 0x9e3779b9) >>> 0);
+  const randn = () => {
+    let u = 0, v = 0;
+    while (u === 0) u = rng();
+    while (v === 0) v = rng();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  };
+
+  const n = 3 * S * S;
+  let x = new Float32Array(n);
+  for (let i = 0; i < n; i++) x[i] = randn();
+
+  // Capped much lower than the WebGPU engine's 20 — each forward pass here
+  // is on the order of a minute in plain JS, so this keeps a generation
+  // bounded to roughly 5-15 minutes instead of potentially 30+.
+  const nSteps = Math.max(1, Math.min(6, steps));
+  const ts = [];
+  for (let i = 0; i < nSteps; i++) ts.push(Math.round((TRAIN_T - 1) * (1 - i / nSteps)));
+  const passesPerStep = guidance !== 1.0 ? 2 : 1;
+  let avgPassMs = null;
+
+  for (let i = 0; i < ts.length; i++) {
+    const t = ts[i];
+    const tNext = i + 1 < ts.length ? ts[i + 1] : -1;
+    const t01 = t / TRAIN_T;
+
+    const stepProgress = (frac) => {
+      const doneSteps = i + frac / passesPerStep;
+      setProgress(0.1 + (doneSteps / ts.length) * 0.9);
+    };
+    const etaMsg = avgPassMs
+      ? ` (~${Math.ceil(avgPassMs * passesPerStep * (ts.length - i) / 1000)}s left)`
+      : "";
+    setStatus(`Generating with our own HQ diffusion model on CPU (step ${i + 1}/${ts.length}, this is slow)…${etaMsg}`, "work");
+
+    const passT0 = performance.now();
+    const noiseCond = await hqUnetForwardCPU(raw, meta, x, t01, cond, (f) => stepProgress(f));
+    let noisePred = noiseCond;
+    if (guidance !== 1.0) {
+      const noiseUncond = await hqUnetForwardCPU(raw, meta, x, t01, zeroCond, (f) => stepProgress(1 + f));
+      noisePred = new Float32Array(noiseCond.length);
+      for (let k = 0; k < noisePred.length; k++) noisePred[k] = noiseUncond[k] + guidance * (noiseCond[k] - noiseUncond[k]);
+    }
+    const passMs = (performance.now() - passT0) / passesPerStep;
+    avgPassMs = avgPassMs === null ? passMs : 0.5 * avgPassMs + 0.5 * passMs;
+
+    const alphaT = acp[t];
+    const alphaPrev = tNext >= 0 ? acp[tNext] : 1.0;
+    const sqrtAT = Math.sqrt(alphaT), sqrt1mAT = Math.sqrt(1 - alphaT);
+    const sqrtAP = Math.sqrt(alphaPrev), sqrt1mAP = Math.sqrt(1 - alphaPrev);
+    for (let k = 0; k < n; k++) {
+      const x0 = (x[k] - sqrt1mAT * noisePred[k]) / sqrtAT;
+      x[k] = sqrtAP * x0 + sqrt1mAP * noisePred[k];
+    }
+  }
+
+  paintTensorToCanvas({ dims: [1, 3, S, S], data: x }, size);
+  setProgress(1);
+  setStatus("Done — generated by our own HQ diffusion model (native 256×256, CPU, DDIM " + nSteps + " steps).", "ok");
+}
+
+/* =====================================================================
    E. UI WIRING
    ===================================================================== */
 function setBusy(b) {
@@ -2203,6 +2515,8 @@ async function onGenerate() {
       await runMyDiffusionEngine(prompt, seed, steps, size);
     } else if (currentEngine === "hqdiffusion") {
       await runHQDiffusionEngine(prompt, seed, steps, size);
+    } else if (currentEngine === "hqcpu") {
+      await runHQDiffusionEngineCPU(prompt, seed, steps, size);
     } else if (currentEngine === "diffusion") {
       try {
         await runDiffusionEngine(prompt, seed, steps, size);
