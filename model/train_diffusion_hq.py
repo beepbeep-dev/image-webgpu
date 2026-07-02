@@ -119,17 +119,21 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 use_amp = device == "cuda"   # bf16 autocast on GPU: ~2x+ speedup, no loss-scaler needed (Ampere/Ada+)
 print("device:", device, " mixed precision:", use_amp)
 
-# ~109M params — a genuine "quality" step up from the original 1.56M tiny
-# model, sized to actually be learnable from our ~100k-image dataset without
-# badly overfitting (unlike an even bigger model would on this much data).
-CHANNELS = (150, 225, 340, 510, 720, 1000)
-EMB_DIM = 384
+# ~21M params — sized to actually fit our real dataset (~6.7k images). The
+# first attempt at 109M params badly overfit/undertrained on this little
+# data (visibly blotchy/painterly output, unaffected by sampling params like
+# guidance scale or step count — confirmed the problem was baked into the
+# weights, not a sampling issue), so this is a deliberately smaller
+# architecture matched to what we actually scraped, not the ~100k-image
+# target we didn't reach.
+CHANNELS = (64, 96, 144, 216, 320, 448)
+EMB_DIM = 192
 model = BigUNet(channels=CHANNELS, emb_dim=EMB_DIM, cdim=EMBED_DIM).to(device)
 cap_enc = CaptionEncoder(len(vocab), EMBED_DIM).to(device)
 print("UNet params:", f"{model.param_count():,}", " caption encoder params:",
       f"{sum(p.numel() for p in cap_enc.parameters()):,}")
 
-LR = 1e-4               # lower than the tiny model's 1e-3: bigger model, be conservative
+LR = 2e-4
 WARMUP = 500
 UNCOND_P = 0.15
 GUIDANCE_SCALE = 3.0
@@ -139,10 +143,8 @@ opt = torch.optim.Adam(list(model.parameters()) + list(cap_enc.parameters()), lr
 all_params = list(model.named_parameters()) + [("word_emb." + k, v) for k, v in cap_enc.embed.named_parameters()]
 ema = {name: p.detach().clone() for name, p in all_params}
 
-STEPS = 12000  # trimmed from 30000: the actual scraped dataset (~6.7k images)
-                # is much smaller than the ~100k originally planned, so fewer
-                # steps reduces overfitting risk and GPU cost proportionally
-BATCH = 16 if device == "cuda" else 8   # 48 OOM'd a 24GB GPU at 256x256 with this ~109M-param model
+STEPS = 12000
+BATCH = 32 if device == "cuda" else 8   # smaller model than before, more VRAM headroom
 
 # Background prefetch: decode the NEXT batch's images on a worker thread
 # while the GPU is busy with the CURRENT step, so SQLite/JPEG decoding isn't
