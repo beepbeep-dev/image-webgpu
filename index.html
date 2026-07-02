@@ -2051,6 +2051,90 @@ async function hqReadBuffer(device, buffer, floatCount) {
   return out;
 }
 
+// Self-attention block (mirrors model_hq.py's SelfAttention2d exactly: a
+// GroupNorm(8, C), a 1x1-conv QKV projection split into (Q,K,V) each split
+// further into num_heads heads, scaled-dot-product attention over all H*W
+// positions, a 1x1-conv output projection, and a residual add of the
+// UN-normalized input). Runs on plain JS typed arrays — used natively by the
+// CPU engine, and via a small CPU round-trip by the WebGPU engine (this data
+// is tiny: at most 320 channels x 256 positions, so reading it off the GPU,
+// computing attention in JS, and uploading the result back is cheap and far
+// simpler/lower-risk than hand-rolling a numerically-stable softmax
+// reduction in WGSL compute shaders).
+function hqAttentionCPU(x, C, H, W, raw, prefix, numHeads = 4) {
+  const HW = H * W;
+  const normW = raw[`${prefix}.norm.weight`], normB = raw[`${prefix}.norm.bias`];
+  const numGroups = 8, groupSize = C / numGroups;
+  const normed = new Float32Array(C * HW);
+  for (let g = 0; g < numGroups; g++) {
+    const cStart = g * groupSize, cEnd = cStart + groupSize, count = groupSize * HW;
+    let sum = 0, sumSq = 0;
+    for (let c = cStart; c < cEnd; c++) {
+      const base = c * HW;
+      for (let i = 0; i < HW; i++) { const v = x[base + i]; sum += v; sumSq += v * v; }
+    }
+    const mean = sum / count;
+    const invStd = 1 / Math.sqrt(Math.max(0, sumSq / count - mean * mean) + 1e-5);
+    for (let c = cStart; c < cEnd; c++) {
+      const base = c * HW, w = normW[c], b = normB[c];
+      for (let i = 0; i < HW; i++) normed[base + i] = (x[base + i] - mean) * invStd * w + b;
+    }
+  }
+
+  const qkvW = raw[`${prefix}.qkv.weight`], qkvB = raw[`${prefix}.qkv.bias`];
+  const qkv = new Float32Array(3 * C * HW);
+  for (let oc = 0; oc < 3 * C; oc++) {
+    const wBase = oc * C, b = qkvB[oc], outBase = oc * HW;
+    for (let pos = 0; pos < HW; pos++) {
+      let s = b;
+      for (let ic = 0; ic < C; ic++) s += normed[ic * HW + pos] * qkvW[wBase + ic];
+      qkv[outBase + pos] = s;
+    }
+  }
+
+  const dHead = C / numHeads, scale = 1 / Math.sqrt(dHead);
+  const attnOut = new Float32Array(C * HW);
+  const scores = new Float32Array(HW * HW);
+  for (let h = 0; h < numHeads; h++) {
+    const qBase = h * dHead * HW, kBase = C * HW + h * dHead * HW, vBase = 2 * C * HW + h * dHead * HW;
+    for (let n = 0; n < HW; n++) {
+      for (let m = 0; m < HW; m++) {
+        let s = 0;
+        for (let d = 0; d < dHead; d++) s += qkv[qBase + d * HW + n] * qkv[kBase + d * HW + m];
+        scores[n * HW + m] = s * scale;
+      }
+    }
+    for (let n = 0; n < HW; n++) {
+      let maxv = -Infinity;
+      for (let m = 0; m < HW; m++) if (scores[n * HW + m] > maxv) maxv = scores[n * HW + m];
+      let sum = 0;
+      for (let m = 0; m < HW; m++) { const e = Math.exp(scores[n * HW + m] - maxv); scores[n * HW + m] = e; sum += e; }
+      const inv = 1 / sum;
+      for (let m = 0; m < HW; m++) scores[n * HW + m] *= inv;
+    }
+    for (let d = 0; d < dHead; d++) {
+      const outBase = (h * dHead + d) * HW;
+      for (let n = 0; n < HW; n++) {
+        let s = 0;
+        for (let m = 0; m < HW; m++) s += scores[n * HW + m] * qkv[vBase + d * HW + m];
+        attnOut[outBase + n] = s;
+      }
+    }
+  }
+
+  const projW = raw[`${prefix}.proj.weight`], projB = raw[`${prefix}.proj.bias`];
+  const out = new Float32Array(C * HW);
+  for (let oc = 0; oc < C; oc++) {
+    const wBase = oc * C, b = projB[oc];
+    for (let pos = 0; pos < HW; pos++) {
+      let s = b;
+      for (let ic = 0; ic < C; ic++) s += attnOut[ic * HW + pos] * projW[wBase + ic];
+      out[oc * HW + pos] = x[oc * HW + pos] + s;
+    }
+  }
+  return out;
+}
+
 // Full BigUNet forward pass on the GPU. Mirrors model_hq.py's BigUNet.forward()
 // exactly (same op order, same skip sourcing) — verified numerically against
 // the PyTorch model (max abs diff ~2.5e-7) before shipping.
@@ -2066,7 +2150,18 @@ async function hqUnetForward(device, P, raw, gpuT, meta, xData, t01, cond) {
   const emb = new Float32Array(embDim);
   for (let i = 0; i < embDim; i++) emb[i] = temb[i] + cemb[i];
 
-  const encoder = device.createCommandEncoder();
+  let encoder = device.createCommandEncoder();
+
+  // Submits whatever GPU work has been queued so far, reads back the given
+  // buffer, runs self-attention on the CPU, uploads the result, and starts a
+  // fresh encoder for subsequent GPU ops to build on.
+  async function attnRoundTrip(x, prefix) {
+    device.queue.submit([encoder.finish()]);
+    const data = await hqReadBuffer(device, x.buffer, x.C * x.H * x.W);
+    const out = hqAttentionCPU(data, x.C, x.H, x.W, raw, prefix);
+    encoder = device.createCommandEncoder();
+    return { buffer: hqStorageBuf(device, out), C: x.C, H: x.H, W: x.W };
+  }
 
   function filmBufFor(prefix, C) {
     const film = linearFwd(emb, raw[`${prefix}.film.weight`], raw[`${prefix}.film.bias`], embDim, 2 * C);
@@ -2101,11 +2196,13 @@ async function hqUnetForward(device, P, raw, gpuT, meta, xData, t01, cond) {
   let h4 = hqConv2d(device, encoder, P, h3.buffer, c3, h3.H, h3.W, gpuT["pool3.weight"], gpuT["pool3.bias"], c4, 2, 1);
   hqSiluInPlace(device, encoder, P, h4.buffer, h4.C * h4.H * h4.W);
   h4 = resBlock(h4, "down4", c4);
+  h4 = await attnRoundTrip(h4, "attn4");
 
   let h5 = hqConv2d(device, encoder, P, h4.buffer, c4, h4.H, h4.W, gpuT["pool4.weight"], gpuT["pool4.bias"], c5, 2, 1);
   hqSiluInPlace(device, encoder, P, h5.buffer, h5.C * h5.H * h5.W);
 
   h5 = resBlock(h5, "mid1", c5);
+  h5 = await attnRoundTrip(h5, "mid_attn");
   h5 = resBlock(h5, "mid2", c5);
 
   let u4 = hqUpsample2x(device, encoder, P, h5.buffer, h5.C, h5.H, h5.W);
@@ -2113,6 +2210,7 @@ async function hqUnetForward(device, P, raw, gpuT, meta, xData, t01, cond) {
   u4 = hqConv2d(device, encoder, P, u4.buffer, u4.C, u4.H, u4.W, gpuT["up4_conv.weight"], gpuT["up4_conv.bias"], c4, 1, 1);
   hqSiluInPlace(device, encoder, P, u4.buffer, u4.C * u4.H * u4.W);
   u4 = resBlock(u4, "up4", c4);
+  u4 = await attnRoundTrip(u4, "up4_attn");
 
   let u3 = hqUpsample2x(device, encoder, P, u4.buffer, u4.C, u4.H, u4.W);
   u3 = hqConcatChannels(device, encoder, u3, h3);
@@ -2368,6 +2466,11 @@ async function hqUnetForwardCPU(raw, meta, xData, t01, cond, onProgress) {
   function filmFor(prefix, C) {
     return linearFwd(emb, raw[`${prefix}.film.weight`], raw[`${prefix}.film.bias`], embDim, 2 * C);
   }
+  async function attn(x, prefix) {
+    const data = hqAttentionCPU(x.data, x.C, x.H, x.W, raw, prefix);
+    await hqMaybeYieldCPU();
+    return { data, C: x.C, H: x.H, W: x.W };
+  }
   async function resBlock(x, prefix, C) {
     let h = await conv(x, raw[`${prefix}.conv1.weight`], raw[`${prefix}.conv1.bias`], C, 1, 1);
     hqSiluCPU(h.data);
@@ -2397,10 +2500,12 @@ async function hqUnetForwardCPU(raw, meta, xData, t01, cond, onProgress) {
   let h4 = await conv(h3, raw["pool3.weight"], raw["pool3.bias"], c4, 2, 1);
   hqSiluCPU(h4.data);
   h4 = await resBlock(h4, "down4", c4);
+  h4 = await attn(h4, "attn4");
 
   let h5 = await conv(h4, raw["pool4.weight"], raw["pool4.bias"], c5, 2, 1);
   hqSiluCPU(h5.data);
   h5 = await resBlock(h5, "mid1", c5);
+  h5 = await attn(h5, "mid_attn");
   h5 = await resBlock(h5, "mid2", c5);
 
   let u4 = hqUpsample2xCPU(h5.data, h5.C, h5.H, h5.W);
@@ -2408,6 +2513,7 @@ async function hqUnetForwardCPU(raw, meta, xData, t01, cond, onProgress) {
   u4 = await conv(u4, raw["up4_conv.weight"], raw["up4_conv.bias"], c4, 1, 1);
   hqSiluCPU(u4.data);
   u4 = await resBlock(u4, "up4", c4);
+  u4 = await attn(u4, "up4_attn");
 
   let u3 = hqUpsample2xCPU(u4.data, u4.C, u4.H, u4.W);
   u3 = hqConcatChannelsCPU(u3, h3);
