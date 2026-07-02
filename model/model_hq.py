@@ -28,6 +28,34 @@ class FiLMResBlock(nn.Module):
         return h + self.skip(x)
 
 
+class SelfAttention2d(nn.Module):
+    """Plain multi-head self-attention over flattened spatial positions, with
+    a GroupNorm + residual (standard ADM/DDPM-style attention block). Pure
+    conv UNets only ever mix information within a 3x3 neighborhood per layer,
+    so two distant regions of the image can only "see" each other after many
+    stacked convs — attention lets every position attend to every other
+    position in a single step, which is the standard fix for conv-only UNets
+    producing locally-plausible but globally-incoherent output (color blobs
+    with no real object structure). Only applied at the two lowest, cheapest
+    resolutions (16x16 and 8x8) since cost grows with (H*W)^2."""
+    def __init__(self, channels, num_heads=4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.norm = nn.GroupNorm(8, channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, 1)
+        self.proj = nn.Conv2d(channels, channels, 1)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        h = self.norm(x)
+        qkv = self.qkv(h).reshape(B, 3, self.num_heads, C // self.num_heads, H * W)
+        q, k, v = qkv.unbind(1)
+        scale = (C // self.num_heads) ** -0.5
+        attn = torch.einsum("bhdn,bhdm->bhnm", q * scale, k).softmax(dim=-1)
+        out = torch.einsum("bhnm,bhdm->bhdn", attn, v).reshape(B, C, H, W)
+        return x + self.proj(out)
+
+
 class BigUNet(nn.Module):
     """256x256 -> 128 -> 64 -> 32 -> 16 -> 8 (mid) -> back up, FiLM-conditioned."""
     def __init__(self, channels=(20, 32, 48, 72, 104, 144), emb_dim=160, cdim=64):
@@ -47,13 +75,16 @@ class BigUNet(nn.Module):
         self.down3 = FiLMResBlock(c3, c3, emb_dim)          # 32
         self.pool3 = nn.Conv2d(c3, c4, 3, stride=2, padding=1)   # ->16
         self.down4 = FiLMResBlock(c4, c4, emb_dim)          # 16
+        self.attn4 = SelfAttention2d(c4)
         self.pool4 = nn.Conv2d(c4, c5, 3, stride=2, padding=1)   # ->8
 
         self.mid1 = FiLMResBlock(c5, c5, emb_dim)
+        self.mid_attn = SelfAttention2d(c5)
         self.mid2 = FiLMResBlock(c5, c5, emb_dim)
 
         self.up4_conv = nn.Conv2d(c5 + c4, c4, 3, padding=1)
         self.up4 = FiLMResBlock(c4, c4, emb_dim)
+        self.up4_attn = SelfAttention2d(c4)
         self.up3_conv = nn.Conv2d(c4 + c3, c3, 3, padding=1)
         self.up3 = FiLMResBlock(c3, c3, emb_dim)
         self.up2_conv = nn.Conv2d(c3 + c2, c2, 3, padding=1)
@@ -74,13 +105,13 @@ class BigUNet(nn.Module):
         h1 = F.silu(self.pool0(h0)); h1 = self.down1(h1, emb)         # 128
         h2 = F.silu(self.pool1(h1)); h2 = self.down2(h2, emb)         # 64
         h3 = F.silu(self.pool2(h2)); h3 = self.down3(h3, emb)         # 32
-        h4 = F.silu(self.pool3(h3)); h4 = self.down4(h4, emb)         # 16
+        h4 = F.silu(self.pool3(h3)); h4 = self.down4(h4, emb); h4 = self.attn4(h4)  # 16
         h5 = F.silu(self.pool4(h4))                                   # 8
 
-        h5 = self.mid1(h5, emb); h5 = self.mid2(h5, emb)
+        h5 = self.mid1(h5, emb); h5 = self.mid_attn(h5); h5 = self.mid2(h5, emb)
 
         u4 = F.interpolate(h5, scale_factor=2, mode="nearest")
-        u4 = F.silu(self.up4_conv(torch.cat([u4, h4], dim=1))); u4 = self.up4(u4, emb)
+        u4 = F.silu(self.up4_conv(torch.cat([u4, h4], dim=1))); u4 = self.up4(u4, emb); u4 = self.up4_attn(u4)
         u3 = F.interpolate(u4, scale_factor=2, mode="nearest")
         u3 = F.silu(self.up3_conv(torch.cat([u3, h3], dim=1))); u3 = self.up3(u3, emb)
         u2 = F.interpolate(u3, scale_factor=2, mode="nearest")

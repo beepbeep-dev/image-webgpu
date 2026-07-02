@@ -89,8 +89,18 @@ def load_images(row_indices):
     by_id = {rid: blob for rid, blob in rows}
     out = np.empty((len(row_indices), 3, S, S), dtype=np.float32)
     for k, idx in enumerate(row_indices):
-        img = np.asarray(Image.open(io.BytesIO(by_id[int(ROW_IDS[idx])])).convert("RGB"), dtype=np.float32) / 255.0
-        out[k] = np.transpose(img * 2 - 1, (2, 0, 1))
+        img = Image.open(io.BytesIO(by_id[int(ROW_IDS[idx])])).convert("RGB")
+        # Cheap augmentation to stretch our real-photo count further: a
+        # random horizontal flip (free, doubles effective variety for the
+        # landscape/city/nature-dominated categories we scraped) plus small
+        # brightness/contrast jitter (photos of the same scene under
+        # slightly different exposure are still valid training signal).
+        if rng.random() < 0.5:
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+        arr = np.asarray(img, dtype=np.float32) / 255.0
+        if rng.random() < 0.5:
+            arr = np.clip(arr * rng.uniform(0.85, 1.15) + rng.uniform(-0.05, 0.05), 0.0, 1.0)
+        out[k] = np.transpose(arr * 2 - 1, (2, 0, 1))
     return out
 
 
