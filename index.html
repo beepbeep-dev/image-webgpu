@@ -223,10 +223,10 @@
       conditional neural field (instant, very smooth, fully embedded, zero
       downloads). 🌀 is a small diffusion model (conditional UNet, iterative
       denoising, also fully embedded) — slower but a genuine noise→image
-      generative process. 🎨/🐌 are the same bigger (~21M-parameter), deeper
-      diffusion model generating natively at 256×256, trained on ~6,700 real
-      photos — too large to embed, so it downloads once (~110 MB, cached by
-      the browser after) from Hugging Face. 🎨 runs its conv-shader inference
+      generative process. 🎨/🐌 are the same bigger (~23M-parameter), deeper
+      diffusion model with self-attention, generating natively at 256×256,
+      trained on ~7,600 real photos — too large to embed, so it downloads
+      once (~125 MB, cached by the browser after) from Hugging Face. 🎨 runs its conv-shader inference
       on real WebGPU (fast); 🐌 runs the identical model as plain JS on the
       CPU for browsers without WebGPU — genuinely slow (minutes per image,
       capped at 6 steps), but works everywhere. ⚡ is a non-learned
@@ -2156,6 +2156,7 @@ async function hqUnetForward(device, P, raw, gpuT, meta, xData, t01, cond) {
   // buffer, runs self-attention on the CPU, uploads the result, and starts a
   // fresh encoder for subsequent GPU ops to build on.
   async function attnRoundTrip(x, prefix) {
+    if (!raw[`${prefix}.qkv.weight`]) return x;  // pre-attention checkpoint: block doesn't exist
     device.queue.submit([encoder.finish()]);
     const data = await hqReadBuffer(device, x.buffer, x.C * x.H * x.W);
     const out = hqAttentionCPU(data, x.C, x.H, x.W, raw, prefix);
@@ -2439,6 +2440,7 @@ function hqConcatChannelsCPU(a, b) {
   return { data: output, C, H, W };
 }
 
+
 // Mirrors hqUnetForward (the WebGPU version) op-for-op, just on plain JS
 // typed arrays. Yields periodically (hqMaybeYieldCPU) so the tab stays
 // responsive and progress can be shown during a pass.
@@ -2467,6 +2469,7 @@ async function hqUnetForwardCPU(raw, meta, xData, t01, cond, onProgress) {
     return linearFwd(emb, raw[`${prefix}.film.weight`], raw[`${prefix}.film.bias`], embDim, 2 * C);
   }
   async function attn(x, prefix) {
+    if (!raw[`${prefix}.qkv.weight`]) return x;  // pre-attention checkpoint: block doesn't exist
     const data = hqAttentionCPU(x.data, x.C, x.H, x.W, raw, prefix);
     await hqMaybeYieldCPU();
     return { data, C: x.C, H: x.H, W: x.W };
