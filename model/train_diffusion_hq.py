@@ -149,7 +149,12 @@ WARMUP = 500
 UNCOND_P = 0.15
 GUIDANCE_SCALE = 3.0
 EMA_DECAY = 0.9995
-opt = torch.optim.Adam(list(model.parameters()) + list(cap_enc.parameters()), lr=LR)
+# AdamW: decoupled weight decay regularizes the weights directly instead of
+# leaking through the adaptive gradient scaling like Adam's L2 would — useful
+# extra regularization at our small dataset size (~7.6k images for 23M params).
+WEIGHT_DECAY = 0.01
+opt = torch.optim.AdamW(list(model.parameters()) + list(cap_enc.parameters()), lr=LR, weight_decay=WEIGHT_DECAY)
+print(f"optimizer: AdamW (lr={LR}, weight_decay={WEIGHT_DECAY})")
 
 all_params = list(model.named_parameters()) + [("word_emb." + k, v) for k, v in cap_enc.embed.named_parameters()]
 ema = {name: p.detach().clone() for name, p in all_params}
