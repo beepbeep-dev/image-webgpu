@@ -351,12 +351,12 @@
 <!-- Our own THIRD trained model: a deeper, native 256x256 conditional
      diffusion UNet (see README "Diffusion HQ (ours)"). Same real-scraped-
      photo + from-scratch-text-encoder approach as the 32x32 model above,
-     trained on ~6.7k real photos. At ~109M params / ~560MB this is far too
+     trained on ~7.6k real photos. At ~23M params / ~125MB this is too
      large to embed like the other two models, so it is fetched on demand
      (see loadHQModelWeights / HQ_MODEL_URL) from a public Hugging Face
      model repo the first time this engine is used, then run via WebGPU
-     compute shaders (see hqUnetForward) since a plain JS loop would be far
-     too slow at this resolution. -->
+     compute shaders (see hqUnetForward) — or as plain JS in the much
+     slower opt-in CPU fallback engine (hqUnetForwardCPU). -->
 
 <script>
 /* ===========================================================================
@@ -1863,7 +1863,7 @@ function hqDdimStep(x, noisePred, alphaT, alphaPrev, n) {
   }
 }
 
-// This model (~109M params, ~560MB as JSON) is far too large to embed inline
+// This model (~23M params, ~125MB as JSON) is far too large to embed inline
 // like the other two from-scratch models, so — same idea as the ONNX
 // Diffusion engine's SD-Turbo download — it's fetched on demand from a
 // public Hugging Face model repo the first time this engine is used.
@@ -2250,7 +2250,7 @@ async function runHQDiffusionEngine(prompt, seed, steps, size) {
     await runNeuralEngine(prompt, seed, steps, size);
     return;
   }
-  if (!HQ_MODEL) setStatus("Downloading our HQ diffusion model (~560 MB, one-time)…", "work");
+  if (!HQ_MODEL) setStatus("Downloading our HQ diffusion model (~125 MB, one-time)…", "work");
   const { meta, raw } = await loadHQModelWeights((frac) => setProgress(frac * 0.5));
   setStatus("Generating with our own HQ diffusion model (256×256, WebGPU)…", "work");
   if (!HQ_GPU_T) HQ_GPU_T = hqLoadModelBuffers(device, raw, Object.keys(raw));
@@ -2547,7 +2547,7 @@ async function hqUnetForwardCPU(raw, meta, xData, t01, cond, onProgress) {
 }
 
 async function runHQDiffusionEngineCPU(prompt, seed, steps, size) {
-  if (!HQ_MODEL) setStatus("Downloading our HQ diffusion model (~560 MB, one-time)…", "work");
+  if (!HQ_MODEL) setStatus("Downloading our HQ diffusion model (~125 MB, one-time)…", "work");
   const { meta, raw } = await loadHQModelWeights((frac) => setProgress(frac * 0.1));
   const { S, T: TRAIN_T, betaStart, betaEnd } = meta;
 

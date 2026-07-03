@@ -29,9 +29,11 @@ Output is **at least 256 × 256 px** (default size on low-memory devices) and up
 
 ## 2. Model / runtime chosen, and why
 
-The app ships **four engines**. The default is **my own neural network, trained
+The app ships **six engines**. The default is **my own neural network, trained
 from scratch** specifically to fit this 3 GB / iPad-9 target; there is also a
-**second, self-trained model** — a genuine small diffusion model (see section A2).
+**second, self-trained model** — a genuine small diffusion model (see section A2) —
+and a **third, bigger self-trained diffusion model** generating natively at
+256×256 (section A3, served in two flavors: WebGPU 🎨 and CPU 🐌).
 
 ### A. 🧬 Neural model — DEFAULT (I trained this myself)
 - **What it is:** a **~31,000-parameter conditional neural field** (a small MLP /
@@ -194,6 +196,56 @@ from scratch** specifically to fit this 3 GB / iPad-9 target; there is also a
   see the difference between the two model families and the two training
   data sources, side by side, both made from scratch, both fully local.
 
+### A3. 🎨/🐌 Diffusion HQ (ours) — a THIRD self-trained model, native 256×256
+- **What it is:** the same genuine DDPM/DDIM recipe as A2, scaled up: a
+  6-level FiLM-conditioned convolutional UNet (256→128→64→32→16→8 and back
+  up with skip connections) with **multi-head self-attention** at the 16×16
+  and 8×8 levels, **~23M parameters** (22.97M UNet + 128k word-embedding
+  text encoder), generating **natively at 256×256** — no upscaling from a
+  tiny working resolution like A2's 32×32.
+- **Data:** `model/scrape_dataset_hq.py` paginates much deeper into the same
+  485 Wikimedia Commons queries as A2, at 256×256 (JPEG, quality 90), into
+  `model/dataset_hq.db` — currently **~7,600 photos across ~108 topics**
+  (the script is resumable; the full 485-topic crawl takes hours). Same
+  license posture and caption cleaning as A2. Training adds random
+  horizontal flips and mild brightness/contrast jitter.
+- **Training** (`model/train_diffusion_hq.py`): unlike the CPU-trained small
+  models, this one needs a real GPU — it was trained on a rented RTX 4090
+  (bf16 autocast, batch 32, EMA, classifier-free guidance, checkpoint every
+  5k steps). At 256×256 the dataset can't be preloaded into RAM, so batches
+  are decoded lazily from SQLite with a background prefetch thread.
+- **An honest journey, documented because the failures taught the real
+  lessons:**
+  1. **109M params / 12k steps** → pure colored static. Too much model for
+     too little data and far too few steps.
+  2. **21M params / 12k steps** → still static. The diagnostic that cracked
+     it: sampled output's pixel std was ~1.0 (noise-scale) vs ~0.48 for real
+     training photos — the model simply hadn't trained long enough, at any
+     size. 256×256 has 64× the pixels of the 32×32 model and needs
+     proportionally more optimization.
+  3. **21M params / 60k steps** → real structure at last, but blown out —
+     fixed at sampling time (no retraining) by **rescaling the model's
+     clean-image estimate toward the real data's variance** each DDIM step
+     (same idea as dynamic thresholding). Output became smooth abstract
+     color compositions.
+  4. **Current: +self-attention, +more data** — pure-conv UNets only mix
+     information within 3×3 neighborhoods per layer, which showed up as
+     locally-plausible but globally-incoherent output, so attention blocks
+     were added at the two cheapest resolutions.
+- **How it runs in the browser:** at ~125 MB the weights can't be embedded,
+  so they're **fetched once on demand** from a public Hugging Face model
+  repo (cached by the browser). Two engines share the weights: **🎨 runs
+  the UNet as WebGPU compute shaders** (WGSL conv/SiLU/FiLM/upsample
+  kernels; the tiny attention tensors round-trip through JS), and **🐌 runs
+  the identical model as plain JavaScript typed-array loops** for devices
+  without WebGPU — genuinely slow (about a minute per denoising step, steps
+  capped at 6, with a live ETA) but it works everywhere. Both were
+  numerically verified against the PyTorch model (max abs diff ~2e-7).
+- **Honest limitation:** ~7.6k photos and ~23M params is still ~5 orders of
+  magnitude less data/compute than a real Stable Diffusion; expect
+  abstract-but-composed imagery that follows the prompt's palette and mood,
+  not sharp photorealistic objects.
+
 ### B. ⚡ Procedural — WebGPU shader (broadest compatibility)
 - A hand-written **WebGPU** fragment shader (WGSL) with a **Canvas2D CPU fallback**:
   domain-warped fractal (fBm) fields colored by a keyword palette, reproducible by
@@ -261,6 +313,11 @@ well below the 3 GB physical limit (often ~1–1.5 GB), so the app computes a
 conservative budget (~880 MB of weights for a 3 GB iPad) and **refuses any model
 larger than that**. A full Stable-Diffusion model is refused on an iPad 9 — but you
 don't need it, because the built-in neural model already runs there.
+
+**Diffusion HQ** (🎨) needs real WebGPU; without it, it falls back to the neural
+model with a clear message. The 🐌 CPU variant runs anywhere (its ~125 MB of
+float32 weights fit the iPad budget) but takes minutes per image — it's an
+explicit opt-in, never an automatic fallback.
 
 ---
 
@@ -351,3 +408,11 @@ python3 model/train.py          # ~19 min on CPU (8000 steps) → writes model_w
   and exports `model/diffusion_model.json`.
 - `model/diffusion_model.json` — exported diffusion model weights, learned
   vocabulary, and word embeddings (also embedded in `index.html`).
+- `model/model_hq.py` — the bigger 6-level attention UNet used by
+  Diffusion HQ (PyTorch).
+- `model/scrape_dataset_hq.py` — scrapes the 256×256 `model/dataset_hq.db`
+  (resumable via `--resume`; not committed, same reasoning as above).
+- `model/train_diffusion_hq.py` — trains Diffusion HQ (PyTorch, needs a real
+  GPU) and exports `diffusion_hq_model.json`, which is published to a public
+  Hugging Face model repo and **fetched on demand** by the app rather than
+  embedded (~125 MB).
