@@ -218,18 +218,18 @@
         <button data-engine="local">⚡ Procedural</button>
         <button data-engine="diffusion">🧠 Diffusion (ONNX)</button>
       </div>
-      <p class="note" style="margin-top:4px">🧬/🌀/🎨/🐌 are all <b>ours</b> — trained
-      from scratch by us, not fine-tuned from someone else's model. 🧬 is a
-      conditional neural field (instant, very smooth, fully embedded, zero
-      downloads). 🌀 is a small diffusion model (conditional UNet, iterative
-      denoising, also fully embedded) — slower but a genuine noise→image
-      generative process. 🎨/🐌 are the same bigger (~23M-parameter), deeper
-      diffusion model with self-attention, generating natively at 256×256,
-      trained on ~7,600 real photos — too large to embed, so it downloads
-      once (~125 MB, cached by the browser after) from Hugging Face. 🎨 runs its conv-shader inference
-      on real WebGPU (fast); 🐌 runs the identical model as plain JS on the
-      CPU for browsers without WebGPU — genuinely slow (minutes per image,
-      capped at 6 steps), but works everywhere. ⚡ is a non-learned
+      <p class="note" style="margin-top:4px">🧬/🌀/🎨/🐌 are all <b>ours</b> —
+      the generative models are trained from scratch by us, not fine-tuned
+      from someone else's. 🧬 is a conditional neural field (instant, very
+      smooth, fully embedded, zero downloads). 🌀 is a small diffusion model
+      (conditional UNet, iterative denoising, also fully embedded) — slower
+      but a genuine noise→image generative process. 🎨/🐌 are the same
+      <b>latent diffusion</b> model (the same recipe Stable Diffusion uses):
+      our own 16M-parameter attention UNet, trained on ~7,600 real photos,
+      denoises a compact 32×32×4 latent, and a tiny pretrained autoencoder
+      (TAESD, MIT license) decodes it to a 256×256 image. Downloads once
+      (~93 MB, cached by the browser after) from Hugging Face, and runs in
+      seconds on any device — no WebGPU needed. ⚡ is a non-learned
       procedural renderer. 🧠 downloads a real pretrained
       Stable-Diffusion-class model (see setup panel below).</p>
 
@@ -2250,7 +2250,7 @@ async function runHQDiffusionEngine(prompt, seed, steps, size) {
     await runNeuralEngine(prompt, seed, steps, size);
     return;
   }
-  if (!HQ_MODEL) setStatus("Downloading our HQ diffusion model (~125 MB, one-time)…", "work");
+  if (!HQ_MODEL) setStatus("Downloading our HQ diffusion model (~93 MB, one-time)…", "work");
   const { meta, raw } = await loadHQModelWeights((frac) => setProgress(frac * 0.5));
   if (meta.kind === "latent") {
     // Latent model: 48x smaller state than pixels, plain JS is fast enough —
@@ -2737,7 +2737,7 @@ async function runHQLatentEngine(prompt, seed, steps, size, meta, raw) {
 }
 
 async function runHQDiffusionEngineCPU(prompt, seed, steps, size) {
-  if (!HQ_MODEL) setStatus("Downloading our HQ diffusion model (~125 MB, one-time)…", "work");
+  if (!HQ_MODEL) setStatus("Downloading our HQ diffusion model (~93 MB, one-time)…", "work");
   const { meta, raw } = await loadHQModelWeights((frac) => setProgress(frac * 0.1));
   if (meta.kind === "latent") {
     await runHQLatentEngine(prompt, seed, steps, size, meta, raw);

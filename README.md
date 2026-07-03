@@ -228,23 +228,37 @@ and a **third, bigger self-trained diffusion model** generating natively at
      clean-image estimate toward the real data's variance** each DDIM step
      (same idea as dynamic thresholding). Output became smooth abstract
      color compositions.
-  4. **Current: +self-attention, +more data** — pure-conv UNets only mix
+  4. **+self-attention, +more data, AdamW** — pure-conv UNets only mix
      information within 3×3 neighborhoods per layer, which showed up as
      locally-plausible but globally-incoherent output, so attention blocks
-     were added at the two cheapest resolutions.
-- **How it runs in the browser:** at ~125 MB the weights can't be embedded,
-  so they're **fetched once on demand** from a public Hugging Face model
-  repo (cached by the browser). Two engines share the weights: **🎨 runs
-  the UNet as WebGPU compute shaders** (WGSL conv/SiLU/FiLM/upsample
-  kernels; the tiny attention tensors round-trip through JS), and **🐌 runs
-  the identical model as plain JavaScript typed-array loops** for devices
-  without WebGPU — genuinely slow (about a minute per denoising step, steps
-  capped at 6, with a live ETA) but it works everywhere. Both were
-  numerically verified against the PyTorch model (max abs diff ~2e-7).
-- **Honest limitation:** ~7.6k photos and ~23M params is still ~5 orders of
-  magnitude less data/compute than a real Stable Diffusion; expect
-  abstract-but-composed imagery that follows the prompt's palette and mood,
-  not sharp photorealistic objects.
+     were added at the two cheapest resolutions. Output became
+     prompt-differentiated (city verticals vs. dune sweeps) but still
+     impressionistic.
+  5. **Current: LATENT diffusion — the change that actually cracked it.**
+     Pixel-space 256×256 from scratch is the hardest version of this
+     problem; every successful small-budget diffusion project (and Stable
+     Diffusion itself) denoises a compressed latent instead. **TAESD** (a
+     tiny pretrained autoencoder, MIT license) compresses each photo to a
+     32×32×4 latent — 48× fewer values — and our from-scratch **LatentUNet**
+     (16M params, attention at 16×16/8×8) learns denoising there, making
+     each training step ~50× cheaper. A 40k-step run took 36 minutes
+     (~$0.25 of GPU) and produces **recognizable photographic scenes**:
+     real-looking dunes at sunset, city lights at night, streams through
+     misty vegetation. To be explicit about provenance: the autoencoder is
+     pretrained (credited), the generative model is entirely ours.
+- **How it runs in the browser:** the weights (~93 MB: our UNet + the
+  bundled TAESD decoder under a `taesd_dec.` prefix) are **fetched once on
+  demand** from a public Hugging Face model repo (cached by the browser).
+  At latent size, plain JavaScript is genuinely fast (~0.3s per UNet pass),
+  so both 🎨 and 🐌 share one JS path and generate in roughly half a minute
+  on any device — **no WebGPU required**. The JS UNet forward, the TAESD
+  decoder port, and the full sampling loop were all numerically verified
+  against PyTorch (max abs diff ~3e-7 / ~8e-6).
+- **Honest limitation:** ~7.6k photos and 16M params is still ~5 orders of
+  magnitude less data/compute than a real Stable Diffusion. Landscapes and
+  scenes (where our training data is dense) come out genuinely
+  photographic-looking; specific objects and creatures (horses, boats,
+  people) are still soft or implied rather than crisply drawn.
 
 ### B. ⚡ Procedural — WebGPU shader (broadest compatibility)
 - A hand-written **WebGPU** fragment shader (WGSL) with a **Canvas2D CPU fallback**:
