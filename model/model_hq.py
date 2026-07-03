@@ -125,3 +125,59 @@ class BigUNet(nn.Module):
 
     def param_count(self):
         return sum(p.numel() for p in self.parameters())
+
+
+class LatentUNet(nn.Module):
+    """UNet for LATENT-space diffusion (the recipe that makes small-budget
+    diffusion actually work): instead of denoising 256x256x3 pixels directly,
+    it denoises the 32x32x4 latent produced by a small pretrained
+    autoencoder (TAESD, MIT-licensed) — 48x fewer values, so the same
+    training budget buys ~50x more optimization steps, and the decoder
+    handles fine texture "for free". 3 levels (32 -> 16 -> 8), with
+    self-attention at 16x16 and 8x8, FiLM-conditioned like BigUNet."""
+    def __init__(self, channels=(192, 288, 384), emb_dim=256, cdim=64, in_ch=4):
+        super().__init__()
+        c0, c1, c2 = channels
+        self.emb_dim = emb_dim
+        self.t_mlp = nn.Sequential(nn.Linear(emb_dim, emb_dim), nn.SiLU(), nn.Linear(emb_dim, emb_dim))
+        self.c_mlp = nn.Sequential(nn.Linear(cdim, emb_dim), nn.SiLU(), nn.Linear(emb_dim, emb_dim))
+
+        self.stem = nn.Conv2d(in_ch, c0, 3, padding=1)
+        self.down0 = FiLMResBlock(c0, c0, emb_dim)               # 32
+        self.pool0 = nn.Conv2d(c0, c1, 3, stride=2, padding=1)   # ->16
+        self.down1 = FiLMResBlock(c1, c1, emb_dim)               # 16
+        self.attn1 = SelfAttention2d(c1)
+        self.pool1 = nn.Conv2d(c1, c2, 3, stride=2, padding=1)   # ->8
+
+        self.mid1 = FiLMResBlock(c2, c2, emb_dim)
+        self.mid_attn = SelfAttention2d(c2)
+        self.mid2 = FiLMResBlock(c2, c2, emb_dim)
+
+        self.up1_conv = nn.Conv2d(c2 + c1, c1, 3, padding=1)
+        self.up1 = FiLMResBlock(c1, c1, emb_dim)
+        self.up1_attn = SelfAttention2d(c1)
+        self.up0_conv = nn.Conv2d(c1 + c0, c0, 3, padding=1)
+        self.up0 = FiLMResBlock(c0, c0, emb_dim)
+
+        self.head = nn.Conv2d(c0, in_ch, 3, padding=1)
+
+    def forward(self, x, t01, cond):
+        temb = self.t_mlp(sinusoidal_embedding(t01, self.emb_dim))
+        cemb = self.c_mlp(cond)
+        emb = temb + cemb
+
+        h0 = F.silu(self.stem(x)); h0 = self.down0(h0, emb)                     # 32
+        h1 = F.silu(self.pool0(h0)); h1 = self.down1(h1, emb); h1 = self.attn1(h1)  # 16
+        h2 = F.silu(self.pool1(h1))                                             # 8
+
+        h2 = self.mid1(h2, emb); h2 = self.mid_attn(h2); h2 = self.mid2(h2, emb)
+
+        u1 = F.interpolate(h2, scale_factor=2, mode="nearest")
+        u1 = F.silu(self.up1_conv(torch.cat([u1, h1], dim=1))); u1 = self.up1(u1, emb); u1 = self.up1_attn(u1)
+        u0 = F.interpolate(u1, scale_factor=2, mode="nearest")
+        u0 = F.silu(self.up0_conv(torch.cat([u0, h0], dim=1))); u0 = self.up0(u0, emb)
+
+        return self.head(u0)
+
+    def param_count(self):
+        return sum(p.numel() for p in self.parameters())
