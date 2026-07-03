@@ -2252,6 +2252,12 @@ async function runHQDiffusionEngine(prompt, seed, steps, size) {
   }
   if (!HQ_MODEL) setStatus("Downloading our HQ diffusion model (~125 MB, one-time)…", "work");
   const { meta, raw } = await loadHQModelWeights((frac) => setProgress(frac * 0.5));
+  if (meta.kind === "latent") {
+    // Latent model: 48x smaller state than pixels, plain JS is fast enough —
+    // one shared path for both engine buttons, no WebGPU needed.
+    await runHQLatentEngine(prompt, seed, steps, size, meta, raw);
+    return;
+  }
   setStatus("Generating with our own HQ diffusion model (256×256, WebGPU)…", "work");
   if (!HQ_GPU_T) HQ_GPU_T = hqLoadModelBuffers(device, raw, Object.keys(raw));
   const P = await hqInitPipelines(device);
@@ -2546,9 +2552,197 @@ async function hqUnetForwardCPU(raw, meta, xData, t01, cond, onProgress) {
   return head.data;
 }
 
+/* ---------------------------------------------------------------------
+   LATENT Diffusion HQ (meta.kind === "latent"): OUR LatentUNet denoises a
+   32x32x4 TAESD latent (48x fewer values than pixels — the recipe every
+   working small-budget diffusion model uses), then the bundled pretrained
+   TAESD decoder (MIT license, weights under the "taesd_dec." prefix in the
+   same model file) reconstructs the 256x256 image. At latent size, plain
+   JS is genuinely fast (~0.3s per UNet pass), so BOTH engine buttons share
+   this one code path — no WebGPU needed.
+   --------------------------------------------------------------------- */
+async function hqLatentUnetForwardCPU(raw, meta, xData, t01, cond) {
+  const L = meta.latentSize, inCh = meta.latentCh;
+  const [c0, c1, c2] = meta.channels;
+  const embDim = meta.embDim;
+  const temb = linearFwd(silu2(linearFwd(sinusoidalEmbedding(t01, embDim), raw["t_mlp.0.weight"], raw["t_mlp.0.bias"], embDim, embDim)),
+    raw["t_mlp.2.weight"], raw["t_mlp.2.bias"], embDim, embDim);
+  const cemb = linearFwd(silu2(linearFwd(cond, raw["c_mlp.0.weight"], raw["c_mlp.0.bias"], meta.cdim, embDim)),
+    raw["c_mlp.2.weight"], raw["c_mlp.2.bias"], embDim, embDim);
+  const emb = new Float32Array(embDim);
+  for (let i = 0; i < embDim; i++) emb[i] = temb[i] + cemb[i];
+
+  const conv = (x, w, b, outC, stride, pad) => hqConv2dCPU(x.data, x.C, x.H, x.W, w, b, outC, stride, pad);
+  function resBlock(x, prefix, C) {
+    const h = conv(x, raw[`${prefix}.conv1.weight`], raw[`${prefix}.conv1.bias`], C, 1, 1);
+    hqSiluCPU(h.data);
+    const film = linearFwd(emb, raw[`${prefix}.film.weight`], raw[`${prefix}.film.bias`], embDim, 2 * C);
+    hqFilmSiluCPU(h.data, C, h.H * h.W, film);
+    const h2 = conv(h, raw[`${prefix}.conv2.weight`], raw[`${prefix}.conv2.bias`], C, 1, 1);
+    hqAddCPU(h2.data, x.data);
+    return h2;
+  }
+  const attn = (x, prefix) => ({ data: hqAttentionCPU(x.data, x.C, x.H, x.W, raw, prefix), C: x.C, H: x.H, W: x.W });
+
+  let h0 = conv({ data: xData, C: inCh, H: L, W: L }, raw["stem.weight"], raw["stem.bias"], c0, 1, 1);
+  hqSiluCPU(h0.data);
+  h0 = resBlock(h0, "down0", c0);
+  await hqMaybeYieldCPU();
+
+  let h1 = conv(h0, raw["pool0.weight"], raw["pool0.bias"], c1, 2, 1);
+  hqSiluCPU(h1.data);
+  h1 = resBlock(h1, "down1", c1);
+  h1 = attn(h1, "attn1");
+  await hqMaybeYieldCPU();
+
+  let h2 = conv(h1, raw["pool1.weight"], raw["pool1.bias"], c2, 2, 1);
+  hqSiluCPU(h2.data);
+  h2 = resBlock(h2, "mid1", c2);
+  h2 = attn(h2, "mid_attn");
+  h2 = resBlock(h2, "mid2", c2);
+  await hqMaybeYieldCPU();
+
+  let u1 = hqUpsample2xCPU(h2.data, h2.C, h2.H, h2.W);
+  u1 = hqConcatChannelsCPU(u1, h1);
+  u1 = conv(u1, raw["up1_conv.weight"], raw["up1_conv.bias"], c1, 1, 1);
+  hqSiluCPU(u1.data);
+  u1 = resBlock(u1, "up1", c1);
+  u1 = attn(u1, "up1_attn");
+  await hqMaybeYieldCPU();
+
+  let u0 = hqUpsample2xCPU(u1.data, u1.C, u1.H, u1.W);
+  u0 = hqConcatChannelsCPU(u0, h0);
+  u0 = conv(u0, raw["up0_conv.weight"], raw["up0_conv.bias"], c0, 1, 1);
+  hqSiluCPU(u0.data);
+  u0 = resBlock(u0, "up0", c0);
+
+  return conv(u0, raw["head.weight"], raw["head.bias"], inCh, 1, 1).data;
+}
+
+// TAESD decoder: Clamp -> conv -> ReLU -> [3x Block, Upsample, conv] x3 ->
+// Block -> conv(->3). Mirrors taesd.py's Decoder(4) exactly; weight keys are
+// the nn.Sequential indices under the "taesd_dec." prefix. All Blocks here
+// are 64->64 so their skip path is the identity.
+const HQ_TAESD_ZERO_BIAS = new Float32Array(64);
+function hqReluCPU(a) { for (let i = 0; i < a.length; i++) if (a[i] < 0) a[i] = 0; }
+async function hqTaesdDecodeCPU(raw, latent, L, onProgress) {
+  const p = "taesd_dec.";
+  const conv = (x, key, outC) => hqConv2dCPU(x.data, x.C, x.H, x.W,
+    raw[p + key + ".weight"], raw[p + key + ".bias"] || HQ_TAESD_ZERO_BIAS, outC, 1, 1);
+  async function block(x, idx) {
+    const h1 = conv(x, idx + ".conv.0", 64); hqReluCPU(h1.data);
+    const h2 = conv(h1, idx + ".conv.2", 64); hqReluCPU(h2.data);
+    const h3 = conv(h2, idx + ".conv.4", 64);
+    hqAddCPU(h3.data, x.data);   // identity skip (all blocks are 64->64)
+    hqReluCPU(h3.data);          // fuse ReLU
+    await hqMaybeYieldCPU();
+    return h3;
+  }
+  // Clamp: tanh(x/3)*3
+  const z = new Float32Array(latent.length);
+  for (let i = 0; i < z.length; i++) z[i] = Math.tanh(latent[i] / 3) * 3;
+  let x = { data: z, C: 4, H: L, W: L };
+  x = conv(x, "1", 64); hqReluCPU(x.data);
+  let done = 0;
+  const stages = [["3", "4", "5", "7"], ["8", "9", "10", "12"], ["13", "14", "15", "17"]];
+  for (const [b1, b2, b3, up] of stages) {
+    x = await block(x, b1); x = await block(x, b2); x = await block(x, b3);
+    x = hqUpsample2xCPU(x.data, x.C, x.H, x.W);
+    x = conv(x, up, 64);
+    done++;
+    if (onProgress) onProgress(done / 4);
+    await hqMaybeYieldCPU();
+  }
+  x = await block(x, "18");
+  x = conv(x, "19", 3);
+  if (onProgress) onProgress(1);
+  // Decoder outputs roughly [0,1]; clamp and remap to [-1,1] for the shared painter.
+  const out = x.data;
+  for (let i = 0; i < out.length; i++) {
+    let v = out[i];
+    if (v < 0) v = 0; else if (v > 1) v = 1;
+    out[i] = v * 2 - 1;
+  }
+  return out;
+}
+
+async function runHQLatentEngine(prompt, seed, steps, size, meta, raw) {
+  const L = meta.latentSize, C = meta.latentCh, TRAIN_T = meta.T;
+  const betas = new Float32Array(TRAIN_T);
+  for (let i = 0; i < TRAIN_T; i++) betas[i] = meta.betaStart + (meta.betaEnd - meta.betaStart) * i / (TRAIN_T - 1);
+  const acp = new Float64Array(TRAIN_T);
+  let cum = 1;
+  for (let i = 0; i < TRAIN_T; i++) { cum *= (1 - betas[i]); acp[i] = cum; }
+
+  const cond = hqPromptToCaptionEmbedding(prompt, meta, raw);
+  const zeroCond = new Float32Array(cond.length);
+  const guidance = meta.guidanceScale || 1.0;
+  const rng = mulberry32((hashString(prompt) ^ (seed >>> 0) ^ 0x9e3779b9) >>> 0);
+  const randn = () => {
+    let u = 0, v = 0;
+    while (u === 0) u = rng();
+    while (v === 0) v = rng();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  };
+  const n = C * L * L;
+  let x = new Float32Array(n);
+  for (let i = 0; i < n; i++) x[i] = randn();
+
+  const nSteps = Math.max(1, Math.min(20, steps));
+  const ts = [];
+  for (let i = 0; i < nSteps; i++) ts.push(Math.round((TRAIN_T - 1) * (1 - i / nSteps)));
+
+  setStatus("Generating with our latent diffusion model (32×32×4 latent → 256×256)…", "work");
+  for (let i = 0; i < ts.length; i++) {
+    const t = ts[i];
+    const tNext = i + 1 < ts.length ? ts[i + 1] : -1;
+    const t01 = t / TRAIN_T;
+    const noiseCond = await hqLatentUnetForwardCPU(raw, meta, x, t01, cond);
+    let noisePred = noiseCond;
+    if (guidance !== 1.0) {
+      const noiseUncond = await hqLatentUnetForwardCPU(raw, meta, x, t01, zeroCond);
+      noisePred = new Float32Array(n);
+      for (let k = 0; k < n; k++) noisePred[k] = noiseUncond[k] + guidance * (noiseCond[k] - noiseUncond[k]);
+    }
+    // Same x0-variance-control idea as the pixel model, but the latents were
+    // normalized to unit variance at training time, so the target is 1.0.
+    const alphaT = acp[t], alphaPrev = tNext >= 0 ? acp[tNext] : 1.0;
+    const sqrtAT = Math.sqrt(alphaT), sqrt1mAT = Math.sqrt(1 - alphaT);
+    const sqrtAP = Math.sqrt(alphaPrev), sqrt1mAP = Math.sqrt(1 - alphaPrev);
+    const x0 = new Float32Array(n);
+    let sumSq = 0;
+    for (let k = 0; k < n; k++) {
+      const v = (x[k] - sqrt1mAT * noisePred[k]) / sqrtAT;
+      x0[k] = v; sumSq += v * v;
+    }
+    const std = Math.sqrt(sumSq / n);
+    const scale = std > 1.0 ? 1.0 / std : 1;
+    for (let k = 0; k < n; k++) {
+      let v = x0[k] * scale;
+      if (v > 3) v = 3; else if (v < -3) v = -3;
+      x[k] = sqrtAP * v + sqrt1mAP * noisePred[k];
+    }
+    setProgress(0.3 + (i + 1) / ts.length * 0.4);
+  }
+
+  setStatus("Decoding the latent to a 256×256 image (TAESD)…", "work");
+  const lscale = meta.lscale || 1.0;
+  const latentRaw = new Float32Array(n);
+  for (let i = 0; i < n; i++) latentRaw[i] = x[i] / lscale;
+  const img = await hqTaesdDecodeCPU(raw, latentRaw, L, (f) => setProgress(0.7 + f * 0.3));
+
+  paintTensorToCanvas({ dims: [1, 3, meta.S, meta.S], data: img }, size);
+  setProgress(1);
+  setStatus("Done — our own latent diffusion model (32×32×4 latent, DDIM " + nSteps + " steps, TAESD decode).", "ok");
+}
+
 async function runHQDiffusionEngineCPU(prompt, seed, steps, size) {
   if (!HQ_MODEL) setStatus("Downloading our HQ diffusion model (~125 MB, one-time)…", "work");
   const { meta, raw } = await loadHQModelWeights((frac) => setProgress(frac * 0.1));
+  if (meta.kind === "latent") {
+    await runHQLatentEngine(prompt, seed, steps, size, meta, raw);
+    return;
+  }
   const { S, T: TRAIN_T, betaStart, betaEnd } = meta;
 
   const betas = new Float32Array(TRAIN_T);
