@@ -15,6 +15,27 @@ from scrape_dataset import (
 )
 import html, re
 
+# People are badly under-represented in the base topic list (only ~11 truly
+# person-centric queries out of 485), and the trained model showed it —
+# person prompts had almost nothing to draw on. These extend the base list.
+PERSON_QUERIES = [
+    "portrait photograph person", "man portrait outdoors", "woman portrait outdoors",
+    "person face closeup", "smiling person", "elderly man portrait", "elderly woman portrait",
+    "person reading book", "person riding bicycle", "person running race",
+    "person playing guitar", "musician performing concert", "street musician",
+    "farmer working field", "chef cooking kitchen", "artist painting outdoors",
+    "person swimming pool", "person skiing snow", "climber mountain rock", "surfer riding wave",
+    "dancer performing stage", "people walking city street", "people sitting cafe",
+    "family picnic park", "couple walking beach", "worker construction site",
+    "teacher classroom students", "vendor market stall",
+    "person horse riding", "person fishing river", "person kayaking water",
+    "runner marathon road", "cyclist road race", "football players match",
+    "basketball players game", "tennis player court", "skateboarder street",
+    "person gardening", "photographer with camera", "hiker backpack trail",
+    "person umbrella rain", "person winter coat snow", "crowd festival celebration",
+]
+QUERIES = list(QUERIES) + PERSON_QUERIES
+
 MAX_AR = 3.2
 THUMB_W = 850   # Wikimedia scales thumbs to this WIDTH; for a landscape photo at
                 # the widest aspect ratio we allow (MAX_AR), the resulting HEIGHT
