@@ -181,3 +181,36 @@ class LatentUNet(nn.Module):
 
     def param_count(self):
         return sum(p.numel() for p in self.parameters())
+
+
+class CaptionEncoderV2(nn.Module):
+    """Order-aware from-scratch text encoder (upgrade over the mean-pooled
+    bag-of-words CaptionEncoder, which couldn't tell "dog chases cat" from
+    "cat chases dog"): learned word embeddings + learned positional
+    embeddings, one masked single-head self-attention layer, a small
+    feed-forward layer, then masked mean-pooling. Still tiny (~150k params)
+    and trained jointly with the UNet on the diffusion loss — small enough
+    to port to plain JS loops exactly."""
+    def __init__(self, vocab_size, dim=64, maxlen=14):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, dim)
+        self.pos = nn.Parameter(torch.randn(maxlen, dim) * 0.02)
+        self.q = nn.Linear(dim, dim)
+        self.k = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, dim)
+        self.attn_out = nn.Linear(dim, dim)
+        self.ff1 = nn.Linear(dim, 2 * dim)
+        self.ff2 = nn.Linear(2 * dim, dim)
+        self.dim = dim
+
+    def forward(self, ids, mask):
+        e = self.embed(ids) + self.pos[None, :, :]            # [B,L,D]
+        q, k, v = self.q(e), self.k(e), self.v(e)
+        scores = torch.einsum("bld,bmd->blm", q, k) / (self.dim ** 0.5)
+        scores = scores.masked_fill(mask[:, None, :] == 0, -1e9)
+        att = torch.einsum("blm,bmd->bld", scores.softmax(-1), v)
+        e = e + self.attn_out(att)
+        e = e + self.ff2(F.silu(self.ff1(e)))
+        summed = (e * mask[:, :, None]).sum(1)
+        count = mask.sum(1, keepdim=True).clamp(min=1.0)
+        return summed / count

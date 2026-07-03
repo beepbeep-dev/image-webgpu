@@ -1931,6 +1931,76 @@ function hqPromptToCaptionEmbedding(prompt, meta, raw) {
     meta.vocab.forEach((w, i) => HQ_MODEL._vocabIndex.set(w, i));
   }
   const words = prompt.toLowerCase().match(/[a-z0-9]+/g) || [];
+  if (meta.textEncoder === "attn") {
+    // Order-aware from-scratch encoder (CaptionEncoderV2 in model_hq.py):
+    // word + positional embeddings, one masked self-attention layer, a
+    // feed-forward layer, masked mean pool. Weights live under the "cap."
+    // prefix. Padded slots use word id 0 exactly like training, and are
+    // masked out of both the attention keys and the final pool.
+    const L = meta.maxlen || 14;
+    const ids = new Int32Array(L);
+    let n = 0;
+    for (const w of words) {
+      if (n >= L) break;
+      const id = HQ_MODEL._vocabIndex.get(w);
+      if (id === undefined) continue;   // vocab excludes stopwords/1-char words already
+      ids[n++] = id;
+    }
+    if (n === 0) return new Float32Array(dim);   // no known words → unconditional
+    const emb = raw["cap.embed.weight"], pos = raw["cap.pos"];
+    const e = new Float32Array(L * dim);
+    for (let l = 0; l < L; l++)
+      for (let d = 0; d < dim; d++) e[l * dim + d] = emb[ids[l] * dim + d] + pos[l * dim + d];
+    const lin = (x, w, b, rows, inD, outD) => {
+      const o = new Float32Array(rows * outD);
+      for (let r = 0; r < rows; r++)
+        for (let j = 0; j < outD; j++) {
+          let s = b[j];
+          const wb = j * inD, xb = r * inD;
+          for (let i = 0; i < inD; i++) s += w[wb + i] * x[xb + i];
+          o[r * outD + j] = s;
+        }
+      return o;
+    };
+    const q = lin(e, raw["cap.q.weight"], raw["cap.q.bias"], L, dim, dim);
+    const k = lin(e, raw["cap.k.weight"], raw["cap.k.bias"], L, dim, dim);
+    const v = lin(e, raw["cap.v.weight"], raw["cap.v.bias"], L, dim, dim);
+    const att = new Float32Array(L * dim);
+    const scale = 1 / Math.sqrt(dim);
+    const scores = new Float32Array(L);
+    for (let l = 0; l < L; l++) {
+      let maxs = -Infinity;
+      for (let m = 0; m < L; m++) {
+        let s = -1e9;   // masked (padded) key
+        if (m < n) {
+          s = 0;
+          for (let d = 0; d < dim; d++) s += q[l * dim + d] * k[m * dim + d];
+          s *= scale;
+        }
+        scores[m] = s;
+        if (s > maxs) maxs = s;
+      }
+      let sum = 0;
+      for (let m = 0; m < L; m++) { const ex = Math.exp(scores[m] - maxs); scores[m] = ex; sum += ex; }
+      for (let m = 0; m < L; m++) {
+        const p = scores[m] / sum;
+        if (p === 0) continue;
+        for (let d = 0; d < dim; d++) att[l * dim + d] += p * v[m * dim + d];
+      }
+    }
+    const ao = lin(att, raw["cap.attn_out.weight"], raw["cap.attn_out.bias"], L, dim, dim);
+    for (let i = 0; i < L * dim; i++) e[i] += ao[i];
+    const dim2 = 2 * dim;
+    const h = lin(e, raw["cap.ff1.weight"], raw["cap.ff1.bias"], L, dim, dim2);
+    for (let i = 0; i < h.length; i++) h[i] = h[i] / (1 + Math.exp(-h[i]));   // SiLU
+    const ff = lin(h, raw["cap.ff2.weight"], raw["cap.ff2.bias"], L, dim2, dim);
+    for (let i = 0; i < L * dim; i++) e[i] += ff[i];
+    const out = new Float32Array(dim);
+    for (let l = 0; l < n; l++)
+      for (let d = 0; d < dim; d++) out[d] += e[l * dim + d];
+    for (let d = 0; d < dim; d++) out[d] /= n;
+    return out;
+  }
   const out = new Float32Array(dim);
   let count = 0;
   const table = raw["word_emb.weight"];
@@ -2725,7 +2795,7 @@ async function runHQLatentEngine(prompt, seed, steps, size, meta, raw) {
     setProgress(0.3 + (i + 1) / ts.length * 0.4);
   }
 
-  setStatus("Decoding the latent to a 256×256 image (TAESD)…", "work");
+  setStatus("Decoding the latent to a 256×256 image…", "work");
   const lscale = meta.lscale || 1.0;
   const latentRaw = new Float32Array(n);
   for (let i = 0; i < n; i++) latentRaw[i] = x[i] / lscale;
@@ -2733,7 +2803,7 @@ async function runHQLatentEngine(prompt, seed, steps, size, meta, raw) {
 
   paintTensorToCanvas({ dims: [1, 3, meta.S, meta.S], data: img }, size);
   setProgress(1);
-  setStatus("Done — our own latent diffusion model (32×32×4 latent, DDIM " + nSteps + " steps, TAESD decode).", "ok");
+  setStatus("Done — our own latent diffusion model (32×32×4 latent, DDIM " + nSteps + " steps, " + (meta.decoder === "own" ? "our own from-scratch decoder" : "TAESD decode") + ").", "ok");
 }
 
 async function runHQDiffusionEngineCPU(prompt, seed, steps, size) {
