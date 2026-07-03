@@ -244,8 +244,20 @@ and a **third, bigger self-trained diffusion model** generating natively at
      each training step ~50× cheaper. A 40k-step run took 36 minutes
      (~$0.25 of GPU) and produces **recognizable photographic scenes**:
      real-looking dunes at sunset, city lights at night, streams through
-     misty vegetation. To be explicit about provenance: the autoencoder is
-     pretrained (credited), the generative model is entirely ours.
+     misty vegetation. Initially the autoencoder was the pretrained TAESD
+     (credited, MIT); see step 6.
+  6. **Current: 100% from scratch.** The pretrained TAESD was replaced by
+     **our own autoencoder** (`model/own_ae.py`, same generic conv topology,
+     weights trained from zero on our photos with an L1+MSE+edge-gradient
+     loss — no borrowed perceptual network), and the bag-of-words text
+     encoder was upgraded to an **order-aware** one (`CaptionEncoderV2`:
+     learned word + positional embeddings and one masked self-attention
+     layer, so "dog chases cat" ≠ "cat chases dog"). One combined GPU run
+     (`model/train_diffusion_own.py`, ~75 min, ~$0.5) trains AE → encodes
+     the dataset → trains UNet + text encoder. Every learned weight in the
+     shipped pipeline — generator, text encoder, autoencoder — is now
+     trained by us on our own scraped data. Quality matched or improved on
+     the TAESD version.
 - **How it runs in the browser:** the weights (~93 MB: our UNet + the
   bundled TAESD decoder under a `taesd_dec.` prefix) are **fetched once on
   demand** from a public Hugging Face model repo (cached by the browser).

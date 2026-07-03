@@ -226,8 +226,11 @@
       but a genuine noise→image generative process. 🎨/🐌 are the same
       <b>latent diffusion</b> model (the same recipe Stable Diffusion uses):
       our own 16M-parameter attention UNet, trained on ~7,600 real photos,
-      denoises a compact 32×32×4 latent, and a tiny pretrained autoencoder
-      (TAESD, MIT license) decodes it to a 256×256 image. Downloads once
+      denoises a compact 32×32×4 latent, our own order-aware text encoder
+      reads the prompt, and our own from-scratch autoencoder decodes the
+      latent to a 256×256 image — every learned weight in this pipeline is
+      trained by us (earlier versions used the MIT-licensed pretrained
+      TAESD decoder; the JS runner still supports those). Downloads once
       (~93 MB, cached by the browser after) from Hugging Face, and runs in
       seconds on any device — no WebGPU needed. ⚡ is a non-learned
       procedural renderer. 🧠 downloads a real pretrained
