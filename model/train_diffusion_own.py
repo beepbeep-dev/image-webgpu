@@ -66,7 +66,7 @@ def img_batch(idx):
 enc = OwnEncoder(LATENT_CH).to(device)
 dec = OwnDecoder(LATENT_CH).to(device)
 print("AE params:", sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in dec.parameters()))
-AE_STEPS = 15000
+AE_STEPS = 20000
 AE_BATCH = 32
 ae_opt = torch.optim.AdamW(list(enc.parameters()) + list(dec.parameters()), lr=3e-4, weight_decay=0.01)
 
@@ -166,7 +166,7 @@ print(f"optimizer: AdamW (lr={LR}, weight_decay=0.01)")
 all_params = list(model.named_parameters()) + [("cap." + k, v) for k, v in cap_enc.named_parameters()]
 ema = {name: p.detach().clone() for name, p in all_params}
 
-STEPS = 40000
+STEPS = 60000
 BATCH = 128 if device == "cuda" else 16
 LAT_T = LATENTS.to(device)
 IDS_T = torch.from_numpy(ids_arr).to(device)
