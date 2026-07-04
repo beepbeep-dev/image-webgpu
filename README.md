@@ -204,11 +204,17 @@ and a **third, bigger self-trained diffusion model** generating natively at
   text encoder), generating **natively at 256×256** — no upscaling from a
   tiny working resolution like A2's 32×32.
 - **Data:** `model/scrape_dataset_hq.py` paginates much deeper into the same
-  485 Wikimedia Commons queries as A2, at 256×256 (JPEG, quality 90), into
-  `model/dataset_hq.db` — currently **~7,600 photos across ~108 topics**
-  (the script is resumable; the full 485-topic crawl takes hours). Same
-  license posture and caption cleaning as A2. Training adds random
-  horizontal flips and mild brightness/contrast jitter.
+  Wikimedia Commons queries as A2, at 256×256 (JPEG, quality 90), plus **43
+  additional person-focused queries** (portraits, musicians, cyclists,
+  hikers, etc. — added specifically because early versions of this model
+  had never seen enough photos of people) for **528 topics total**, into
+  `model/dataset_hq.db`. On top of Wikimedia, `model/scrape_multi_source.py`
+  adds four more no-signup, legally-clean sources — **Openverse**
+  (permissive-license aggregator), **NASA Images**, **Library of Congress**,
+  and **Met Museum Open Access** (filtered to public-domain photographs) —
+  each with its own license/rights filtering. Combined: **15,922 photos**.
+  Same caption cleaning as A2. Training adds random horizontal flips and
+  mild brightness/contrast jitter.
 - **Training** (`model/train_diffusion_hq.py`): unlike the CPU-trained small
   models, this one needs a real GPU — it was trained on a rented RTX 4090
   (bf16 autocast, batch 32, EMA, classifier-free guidance, checkpoint every
@@ -253,11 +259,25 @@ and a **third, bigger self-trained diffusion model** generating natively at
      encoder was upgraded to an **order-aware** one (`CaptionEncoderV2`:
      learned word + positional embeddings and one masked self-attention
      layer, so "dog chases cat" ≠ "cat chases dog"). One combined GPU run
-     (`model/train_diffusion_own.py`, ~75 min, ~$0.5) trains AE → encodes
-     the dataset → trains UNet + text encoder. Every learned weight in the
-     shipped pipeline — generator, text encoder, autoencoder — is now
-     trained by us on our own scraped data. Quality matched or improved on
-     the TAESD version.
+     (`model/train_diffusion_own.py`) trains AE → encodes the dataset →
+     trains UNet + text encoder. Every learned weight in the shipped
+     pipeline — generator, text encoder, autoencoder — is now trained by
+     us on our own scraped data. Quality matched or improved on the TAESD
+     version.
+  7. **More data, same limitation.** After the dataset grew from 9,590 to
+     15,922 photos (the multi-source expansion above) the model was
+     retrained with a proportionally larger budget (AE 30k steps, diffusion
+     90k steps, ~90 min total). Scene/landscape prompts (city streets at
+     night, desert dunes, snowy peaks) are consistently solid. Person and
+     portrait prompts, despite 43 dedicated queries and several thousand
+     more person-containing photos, still come out as abstract color/shape
+     compositions with no recognizable face or figure — a real result, not
+     a bug: at 16M parameters and low-thousands of person photos (spread
+     across many distinct poses/scenes/lighting conditions), there just
+     isn't enough repeated structure for the model to learn what a face or
+     body reliably looks like. Human anatomy needs far more image density
+     than scenery to converge, and that's a compute/data scale problem, not
+     something the architecture can fix.
 - **How it runs in the browser:** the weights (~93 MB: our UNet + the
   bundled TAESD decoder under a `taesd_dec.` prefix) are **fetched once on
   demand** from a public Hugging Face model repo (cached by the browser).
@@ -266,11 +286,12 @@ and a **third, bigger self-trained diffusion model** generating natively at
   on any device — **no WebGPU required**. The JS UNet forward, the TAESD
   decoder port, and the full sampling loop were all numerically verified
   against PyTorch (max abs diff ~3e-7 / ~8e-6).
-- **Honest limitation:** ~7.6k photos and 16M params is still ~5 orders of
+- **Honest limitation:** ~15.9k photos and 16M params is still ~5 orders of
   magnitude less data/compute than a real Stable Diffusion. Landscapes and
   scenes (where our training data is dense) come out genuinely
-  photographic-looking; specific objects and creatures (horses, boats,
-  people) are still soft or implied rather than crisply drawn.
+  photographic-looking; specific objects and creatures, and especially
+  people/portraits, are still soft, abstract, or implied rather than
+  crisply drawn — more data helped narrow this gap but did not close it.
 
 ### B. ⚡ Procedural — WebGPU shader (broadest compatibility)
 - A hand-written **WebGPU** fragment shader (WGSL) with a **Canvas2D CPU fallback**:
