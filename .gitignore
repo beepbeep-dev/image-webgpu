@@ -4,4 +4,6 @@ model/*.log
 model/dataset_real.db-journal
 model/dataset_real.db
 model/dataset_hq.db-journal
+model/dataset_hq.db-wal
+model/dataset_hq.db-shm
 model/dataset_hq.db

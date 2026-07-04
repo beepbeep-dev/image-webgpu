@@ -283,9 +283,18 @@ def main():
         print("usage: scrape_multi_source.py <openverse|nasa|loc|met> [query ...]")
         sys.exit(1)
     if not queries:
-        from scrape_dataset import QUERIES
+        # scrape_dataset_hq's QUERIES includes the 43 person-focused queries
+        # added on top of the base 485 -- use that (528 total), not the base
+        # list, so the new sources cover people too.
+        from scrape_dataset_hq import QUERIES
         queries = QUERIES
-    con = sqlite3.connect("dataset_hq.db")
+    # busy_timeout + WAL: multiple source scripts run concurrently against
+    # the same dataset_hq.db, and SQLite's default rollback-journal mode
+    # errors immediately ("database is locked") under concurrent writers
+    # instead of waiting.
+    con = sqlite3.connect("dataset_hq.db", timeout=30)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=30000")
     fetch = SOURCES[source_name]
     total = 0
     t0 = time.time()
