@@ -212,9 +212,9 @@ and a **third, bigger self-trained diffusion model** generating natively at
   adds four more no-signup, legally-clean sources — **Openverse**
   (permissive-license aggregator), **NASA Images**, **Library of Congress**,
   and **Met Museum Open Access** (filtered to public-domain photographs) —
-  each with its own license/rights filtering. Combined: **15,922 photos**.
-  Same caption cleaning as A2. Training adds random horizontal flips and
-  mild brightness/contrast jitter.
+  each with its own license/rights filtering, run to completion twice —
+  **33,251 photos combined**. Same caption cleaning as A2. Training adds
+  random horizontal flips and mild brightness/contrast jitter.
 - **Training** (`model/train_diffusion_hq.py`): unlike the CPU-trained small
   models, this one needs a real GPU — it was trained on a rented RTX 4090
   (bf16 autocast, batch 32, EMA, classifier-free guidance, checkpoint every
@@ -278,6 +278,17 @@ and a **third, bigger self-trained diffusion model** generating natively at
      body reliably looks like. Human anatomy needs far more image density
      than scenery to converge, and that's a compute/data scale problem, not
      something the architecture can fix.
+  8. **Doubling the data again, on a shorter run.** The Openverse/NASA/LoC
+     scrapes were run to completion, growing the dataset from 15,922 to
+     **33,251 photos**. Retrained with a shorter 40k-step diffusion run
+     (down from 90k, ~37 min total) to see how much of the improvement
+     comes from data volume versus step count. Result: scene prompts stayed
+     solid, and person/animal prompts started showing faint emergent
+     *shape* for the first time — a human silhouette on a beach, a rough
+     four-legged form on a horse-riding prompt — where earlier runs gave
+     pure abstract color fields. Still nowhere near a recognizable face or
+     portrait, but the direction is real: more data density is doing more
+     for this model than more optimizer steps at this point.
 - **How it runs in the browser:** the weights (~93 MB: our UNet + the
   bundled TAESD decoder under a `taesd_dec.` prefix) are **fetched once on
   demand** from a public Hugging Face model repo (cached by the browser).
@@ -286,7 +297,7 @@ and a **third, bigger self-trained diffusion model** generating natively at
   on any device — **no WebGPU required**. The JS UNet forward, the TAESD
   decoder port, and the full sampling loop were all numerically verified
   against PyTorch (max abs diff ~3e-7 / ~8e-6).
-- **Honest limitation:** ~15.9k photos and 16M params is still ~5 orders of
+- **Honest limitation:** ~33k photos and 16M params is still ~5 orders of
   magnitude less data/compute than a real Stable Diffusion. Landscapes and
   scenes (where our training data is dense) come out genuinely
   photographic-looking; specific objects and creatures, and especially
