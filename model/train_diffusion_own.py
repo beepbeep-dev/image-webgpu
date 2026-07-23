@@ -166,7 +166,7 @@ print(f"optimizer: AdamW (lr={LR}, weight_decay=0.01)")
 all_params = list(model.named_parameters()) + [("cap." + k, v) for k, v in cap_enc.named_parameters()]
 ema = {name: p.detach().clone() for name, p in all_params}
 
-STEPS = 90000
+STEPS = 40000
 BATCH = 128 if device == "cuda" else 16
 LAT_T = LATENTS.to(device)
 IDS_T = torch.from_numpy(ids_arr).to(device)
