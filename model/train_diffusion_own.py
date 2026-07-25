@@ -41,17 +41,34 @@ LATENT_CH = 4
 # Load all images once (7.6k x 256x256x3 uint8 ≈ 1.5GB RAM — fine).
 # ---------------------------------------------------------------------------
 con = sqlite3.connect("dataset_hq.db")
-rows = con.execute("SELECT caption, image FROM samples").fetchall()
+rows = con.execute("SELECT query, caption, image FROM samples").fetchall()
 con.close()
 N = len(rows)
 print("dataset:", N, "photos")
 IMGS = np.empty((N, 3, S, S), dtype=np.uint8)
 captions = []
-for i, (cap, blob) in enumerate(rows):
+is_portrait = np.zeros(N, dtype=bool)
+for i, (q, cap, blob) in enumerate(rows):
     img = np.asarray(Image.open(io.BytesIO(blob)).convert("RGB"), dtype=np.uint8)
     IMGS[i] = np.transpose(img, (2, 0, 1))
     captions.append(cap)
+    is_portrait[i] = q.startswith("portrait_aligned:")
 del rows
+
+# Face-aligned portraits are a small slice of the dataset but are the only
+# rows with consistent face scale/position (see align_faces.py) — oversample
+# them heavily so the model actually gets enough gradient signal on faces to
+# learn stable facial structure instead of averaging them away.
+PORTRAIT_OVERSAMPLE = 12
+n_portrait = int(is_portrait.sum())
+print("portrait_aligned rows:", n_portrait, f"(oversampled {PORTRAIT_OVERSAMPLE}x)")
+portrait_idx = np.nonzero(is_portrait)[0]
+SAMPLE_POOL = np.concatenate([np.arange(N), np.tile(portrait_idx, max(0, PORTRAIT_OVERSAMPLE - 1))]) \
+    if n_portrait > 0 else np.arange(N)
+
+
+def sample_indices(rng, batch):
+    return SAMPLE_POOL[rng.integers(0, len(SAMPLE_POOL), batch)]
 
 
 def img_batch(idx):
@@ -82,7 +99,7 @@ def edge_loss(a, b):
 t0 = time.time()
 ema_l = None
 for step in range(1, AE_STEPS + 1):
-    x = img_batch(rng.integers(0, N, AE_BATCH))
+    x = img_batch(sample_indices(rng, AE_BATCH))
     ae_opt.zero_grad()
     with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=use_amp):
         z = enc(x)
@@ -207,7 +224,7 @@ def export_model():
 t0 = time.time()
 ema_loss = None
 for step in range(1, STEPS + 1):
-    idx = torch.from_numpy(rng.integers(0, N, BATCH)).to(device)
+    idx = torch.from_numpy(sample_indices(rng, BATCH)).to(device)
     x0 = LAT_T[idx]
     flip = torch.rand(BATCH, device=device) < 0.5
     x0 = torch.where(flip[:, None, None, None], x0.flip(-1), x0)
