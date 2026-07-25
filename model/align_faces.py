@@ -28,16 +28,36 @@ import numpy as np
 from PIL import Image
 
 FACE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+EYE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
 MARGIN = 2.2
 MIN_FACE = 40
 
+# Haar face cascades throw plenty of false positives on non-face textures
+# (arches, cloud formations, flower petals all matched in an earlier run) —
+# restricting the scan to captions that plausibly contain a person, and then
+# requiring a detected eye pair *inside* the candidate face box, cuts that
+# false-positive rate down to something usable.
+PERSON_WORDS = re.compile(
+    r"\b(person|people|man|men|woman|women|boy|girl|child|children|kid|kids|"
+    r"portrait|face|smil\w*|musician|dancer|athlete|player|runner|cyclist|"
+    r"hiker|skier|swimmer|surfer|climber|farmer|chef|artist|teacher|worker|"
+    r"vendor|photographer|crowd|festival|couple|family|tourist|selfie|actor|"
+    r"actress|model|bride|groom|baby|elderly|senior|student|soldier|nurse|"
+    r"doctor|cook|driver|pilot|singer|guitarist|drummer)\b", re.I)
+
 
 def biggest_face(gray):
-    faces = FACE_CASCADE.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=6, minSize=(MIN_FACE, MIN_FACE))
+    faces = FACE_CASCADE.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=7, minSize=(MIN_FACE, MIN_FACE))
     if len(faces) == 0:
         return None
     faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
-    return faces[0]
+    for f in faces:
+        x, y, w, h = f
+        face_roi = gray[y:y + h, x:x + w]
+        eyes = EYE_CASCADE.detectMultiScale(face_roi, scaleFactor=1.05, minNeighbors=4, minSize=(w // 10, h // 10))
+        if len(eyes) >= 1:
+            return f
+    return None
 
 
 def crop_around_face(img, face, margin=MARGIN):
@@ -88,10 +108,11 @@ def main():
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA busy_timeout=30000")
     cur = con.cursor()
-    rows = cur.execute(
+    all_rows = cur.execute(
         "SELECT page_id, query, caption, image FROM samples WHERE query NOT LIKE 'portrait_aligned:%'"
     ).fetchall()
-    print("scanning", len(rows), "images for faces", flush=True)
+    rows = [r for r in all_rows if PERSON_WORDS.search(r[2] or "") or PERSON_WORDS.search(r[1] or "")]
+    print(f"scanning {len(rows)} person-likely images (of {len(all_rows)} total) for faces", flush=True)
     saved = 0
     t0 = time.time()
     for i, (pid, q, cap, blob) in enumerate(rows):
