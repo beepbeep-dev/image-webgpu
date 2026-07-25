@@ -71,9 +71,9 @@ TOPIC_PATTERNS = {
 weight = np.ones(N, dtype=np.float64)
 for i, (q, cap) in enumerate(zip(queries, captions)):
     if q.startswith("portrait_aligned:"):
-        weight[i] = 12
+        weight[i] = 16
     elif q.startswith("person_aligned:"):
-        weight[i] = 6
+        weight[i] = 10
     else:
         for name, (pat, w) in TOPIC_PATTERNS.items():
             if pat.search(cap or ""):
@@ -208,7 +208,7 @@ print(f"optimizer: AdamW (lr={LR}, weight_decay=0.01)")
 all_params = list(model.named_parameters()) + [("cap." + k, v) for k, v in cap_enc.named_parameters()]
 ema = {name: p.detach().clone() for name, p in all_params}
 
-STEPS = 40000
+STEPS = 60000
 BATCH = 128 if device == "cuda" else 16
 LAT_T = LATENTS.to(device)
 IDS_T = torch.from_numpy(ids_arr).to(device)
