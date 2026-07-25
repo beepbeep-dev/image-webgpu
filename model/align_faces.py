@@ -28,15 +28,14 @@ import numpy as np
 from PIL import Image
 
 FACE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-EYE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
 MARGIN = 2.2
 MIN_FACE = 40
 
 # Haar face cascades throw plenty of false positives on non-face textures
 # (arches, cloud formations, flower petals all matched in an earlier run) —
-# restricting the scan to captions that plausibly contain a person, and then
-# requiring a detected eye pair *inside* the candidate face box, cuts that
-# false-positive rate down to something usable.
+# restricting the scan to captions/queries that plausibly contain a person
+# cuts the false-positive surface down to something usable (see
+# biggest_face() for the minNeighbors tuning that handles the rest).
 PERSON_WORDS = re.compile(
     r"\b(person|people|man|men|woman|women|boy|girl|child|children|kid|kids|"
     r"portrait|face|smil\w*|musician|dancer|athlete|player|runner|cyclist|"
@@ -47,17 +46,17 @@ PERSON_WORDS = re.compile(
 
 
 def biggest_face(gray):
+    # Tuned empirically against a visual precision check: minNeighbors=7
+    # with no eye-detection gate gave ~88-90% real faces on the person-
+    # filtered candidate pool (229 faces), a much better volume/precision
+    # trade than requiring a detected eye (93 faces, higher precision but
+    # too little volume to oversample without risking memorizing a handful
+    # of specific people) or minNeighbors=5 (313 faces but ~35% garbage).
     faces = FACE_CASCADE.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=7, minSize=(MIN_FACE, MIN_FACE))
     if len(faces) == 0:
         return None
     faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
-    for f in faces:
-        x, y, w, h = f
-        face_roi = gray[y:y + h, x:x + w]
-        eyes = EYE_CASCADE.detectMultiScale(face_roi, scaleFactor=1.05, minNeighbors=4, minSize=(w // 10, h // 10))
-        if len(eyes) >= 1:
-            return f
-    return None
+    return faces[0]
 
 
 def crop_around_face(img, face, margin=MARGIN):
