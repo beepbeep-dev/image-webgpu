@@ -47,24 +47,49 @@ N = len(rows)
 print("dataset:", N, "photos")
 IMGS = np.empty((N, 3, S, S), dtype=np.uint8)
 captions = []
-is_portrait = np.zeros(N, dtype=bool)
+queries = []
 for i, (q, cap, blob) in enumerate(rows):
     img = np.asarray(Image.open(io.BytesIO(blob)).convert("RGB"), dtype=np.uint8)
     IMGS[i] = np.transpose(img, (2, 0, 1))
     captions.append(cap)
-    is_portrait[i] = q.startswith("portrait_aligned:")
+    queries.append(q)
 del rows
 
-# Face-aligned portraits are a small slice of the dataset but are the only
-# rows with consistent face scale/position (see align_faces.py) — oversample
-# them heavily so the model actually gets enough gradient signal on faces to
-# learn stable facial structure instead of averaging them away.
-PORTRAIT_OVERSAMPLE = 12
-n_portrait = int(is_portrait.sum())
-print("portrait_aligned rows:", n_portrait, f"(oversampled {PORTRAIT_OVERSAMPLE}x)")
-portrait_idx = np.nonzero(is_portrait)[0]
-SAMPLE_POOL = np.concatenate([np.arange(N), np.tile(portrait_idx, max(0, PORTRAIT_OVERSAMPLE - 1))]) \
-    if n_portrait > 0 else np.arange(N)
+# Oversample weight per row: aligned faces/bodies are a small slice of the
+# dataset but are the only rows with consistent scale/position (see
+# align_faces.py / align_people.py) — oversample them heavily so the model
+# gets enough gradient signal to learn stable structure instead of
+# averaging it away. A handful of scene topics that already render well
+# (beach/desert/mountain/city) get a lighter boost just to make them more
+# reliable, not to fix a detection gap.
+TOPIC_PATTERNS = {
+    "beach": (re.compile(r"\bbeach\b", re.I), 3),
+    "desert": (re.compile(r"\bdesert\b|\bdune", re.I), 3),
+    "mountain": (re.compile(r"\bmountain\b|\bpeak\b", re.I), 3),
+    "city": (re.compile(r"\bcity\b|\bskyline\b", re.I), 3),
+}
+weight = np.ones(N, dtype=np.float64)
+for i, (q, cap) in enumerate(zip(queries, captions)):
+    if q.startswith("portrait_aligned:"):
+        weight[i] = 12
+    elif q.startswith("person_aligned:"):
+        weight[i] = 6
+    else:
+        for name, (pat, w) in TOPIC_PATTERNS.items():
+            if pat.search(cap or ""):
+                weight[i] = max(weight[i], w)
+
+for name in ["portrait_aligned", "person_aligned"] + list(TOPIC_PATTERNS):
+    if name in ("portrait_aligned", "person_aligned"):
+        n = sum(1 for q in queries if q.startswith(name + ":"))
+    else:
+        pat, _ = TOPIC_PATTERNS[name]
+        n = sum(1 for cap in captions if pat.search(cap or ""))
+    print(f"{name} rows: {n}")
+
+# Build the sample pool by repeating each row index proportional to its
+# integer weight (weights here are all small integers, so this is exact).
+SAMPLE_POOL = np.repeat(np.arange(N), weight.astype(np.int64))
 
 
 def sample_indices(rng, batch):
