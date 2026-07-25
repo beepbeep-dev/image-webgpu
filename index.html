@@ -1933,7 +1933,19 @@ function hqPromptToCaptionEmbedding(prompt, meta, raw) {
     HQ_MODEL._vocabIndex = new Map();
     meta.vocab.forEach((w, i) => HQ_MODEL._vocabIndex.set(w, i));
   }
-  const words = prompt.toLowerCase().match(/[a-z0-9]+/g) || [];
+  // The face-aligned portrait training data (see align_faces.py) was all
+  // captioned "portrait of a <person> face closeup" — the order-aware text
+  // encoder is sensitive enough to exact phrasing that a bare "portrait of
+  // a man" doesn't reliably reach that learned face structure. Any prompt
+  // that already signals portrait/headshot framing gets the same suffix
+  // appended internally so users get recognizable faces without needing to
+  // know the magic words; scene-style prompts ("a person walking on the
+  // beach") are left untouched since they aren't asking for a close-up.
+  let effectivePrompt = prompt;
+  if (meta.textEncoder === "attn" && /\b(portrait|headshot|selfie)\b/i.test(prompt) && !/\b(closeup|close-up|face)\b/i.test(prompt)) {
+    effectivePrompt = prompt + " face closeup";
+  }
+  const words = effectivePrompt.toLowerCase().match(/[a-z0-9]+/g) || [];
   if (meta.textEncoder === "attn") {
     // Order-aware from-scratch encoder (CaptionEncoderV2 in model_hq.py):
     // word + positional embeddings, one masked self-attention layer, a
