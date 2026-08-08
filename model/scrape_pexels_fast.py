@@ -65,6 +65,32 @@ PEXELS_TMPL = ("https://images.pexels.com/photos/{id}/pexels-photo-{id}.{ext}"
 _ID_RE = re.compile(r"/photos/(\d+)/")
 
 
+# VLM captions almost all open with the same throat-clearing ("The image
+# presents a...", "In this image we see..."). Our tokenizer keeps only the
+# first MAXLEN=14 non-stopword tokens, so that preamble would eat roughly a
+# third of the usable caption on every single row. Strip it.
+_PREAMBLE_RE = re.compile(
+    r"^\s*(?:in\s+)?(?:this|the)\s+(?:image|photo|photograph|picture|scene)\s*"
+    r"(?:we\s+see|shows?|depicts?|presents?|features?|captures?|displays?|"
+    r"showcases?|portrays?|is|appears\s+to\s+(?:show|be)|contains?)?\s*"
+    r"[:,]?\s*(?:(?:a|an|the)\s+)?", re.I)
+_LEADIN_RE = re.compile(
+    r"^\s*(?:here\s+(?:we\s+see|is)|there\s+(?:is|are))\s+(?:(?:a|an|the)\s+)?", re.I)
+
+
+def clean_caption(text):
+    """Strip VLM boilerplate and collapse whitespace."""
+    t = re.sub(r"\s+", " ", (text or "").replace("\n", " ")).strip()
+    for _ in range(2):                      # e.g. "The image shows a photo of ..."
+        new = _PREAMBLE_RE.sub("", t, count=1)
+        new = _LEADIN_RE.sub("", new, count=1)
+        if new == t:
+            break
+        t = new
+    t = t.strip(" ,.:;-")
+    return (t[:1].upper() + t[1:]) if t else ""
+
+
 def rewrite_url(url, width, ext=None):
     """Force any Pexels URL to a CDN-resized JPEG of the requested width.
 
@@ -147,7 +173,7 @@ def load_manifest(source, limit, width, caption_field, cache_dir):
             u = rewrite_url(url, width)
             if not u:
                 continue
-            items.append((u, (cap or "").strip()))
+            items.append((u, clean_caption(cap)))
             if limit and len(items) >= limit:
                 break
     elif source == "meta":
@@ -167,7 +193,7 @@ def load_manifest(source, limit, width, caption_field, cache_dir):
                 pid = t["id"][i]
                 if pid is None:
                     continue
-                cap = (t["alt_text"][i] or t["description"][i] or t["title"][i] or "").strip()
+                cap = clean_caption(t["alt_text"][i] or t["description"][i] or t["title"][i] or "")
                 items.append((PEXELS_TMPL.format(id=int(pid), ext="jpeg", w=width), cap))
                 if limit and len(items) >= limit:
                     return items
@@ -332,9 +358,187 @@ async def run(items, args):
     print(f"db now holds {n} rows -> {args.db}")
 
 
+# ---------------------------------------------------------------------------
+# Bulk mode: stream a HuggingFace tar shard with parallel range requests.
+#
+# This is the only mode that can hit ~100k images/minute. Per-image scraping
+# is capped by the origin's request rate (Pexels throttles one client to
+# ~220 img/s no matter the concurrency), whereas a bulk archive is limited
+# only by bandwidth -- and one HTTP connection to HF gets ~12 MB/s while 16
+# in parallel get ~110 MB/s, so reading the tar sequentially would waste 90%
+# of the link. ParallelRangeReader keeps N range requests in flight and
+# hands the bytes back strictly in order, so tarfile can stream over it.
+# ---------------------------------------------------------------------------
+class ParallelRangeReader(io.RawIOBase):
+    def __init__(self, url, size, chunk=(16 << 20), lookahead=16, ua=DEFAULT_UA):
+        import urllib.request
+        self._url, self._size, self._chunk = url, size, chunk
+        self._req = urllib.request
+        self._ua = ua
+        self._pos = 0            # byte offset of next chunk to *request*
+        self._buf = b""
+        self._bufpos = 0
+        self._idx = 0
+        self._n_chunks = (size + chunk - 1) // chunk
+        self._pool = __import__("concurrent.futures", fromlist=["x"]).ThreadPoolExecutor(max_workers=lookahead)
+        self._futs = {}
+        self._lookahead = lookahead
+        self.bytes_read = 0
+        for _ in range(lookahead):
+            self._submit_next()
+
+    def _fetch(self, i):
+        lo = i * self._chunk
+        hi = min(lo + self._chunk, self._size) - 1
+        for attempt in range(4):
+            try:
+                r = self._req.Request(self._url, headers={"User-Agent": self._ua,
+                                                          "Range": f"bytes={lo}-{hi}"})
+                with self._req.urlopen(r, timeout=60) as resp:
+                    return resp.read()
+            except Exception:
+                if attempt == 3:
+                    raise
+                time.sleep(1.0 * (attempt + 1))
+
+    def _submit_next(self):
+        if self._idx < self._n_chunks:
+            self._futs[self._idx] = self._pool.submit(self._fetch, self._idx)
+            self._idx += 1
+
+    def readable(self):
+        return True
+
+    def readinto(self, b):
+        need = len(b)
+        if self._bufpos >= len(self._buf):
+            nxt = self._pos // self._chunk
+            if nxt >= self._n_chunks:
+                return 0
+            fut = self._futs.pop(nxt, None)
+            if fut is None:
+                fut = self._pool.submit(self._fetch, nxt)
+            self._buf = fut.result()
+            self._bufpos = 0
+            self._pos += len(self._buf)
+            self._submit_next()
+        take = min(need, len(self._buf) - self._bufpos)
+        b[:take] = self._buf[self._bufpos:self._bufpos + take]
+        self._bufpos += take
+        self.bytes_read += take
+        return take
+
+    def close(self):
+        try:
+            self._pool.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            self._pool.shutdown(wait=False)
+        super().close()
+
+
+BULK_SHARDS = {
+    # 342k CC12M photos, pre-resized to 512x512 square, ~46 KB each.
+    # Filenames are content hashes of the *originals*, so they cannot be
+    # joined back to the caption index -- these arrive uncaptioned. Still
+    # useful: the autoencoder stage trains without captions at all.
+    "xlsd512": ("https://huggingface.co/datasets/opendiffusionai/cc12m-xlsd-512px/"
+                "resolve/main/xlsd-square-512px.tar", 16626008064),
+}
+
+
+def run_bulk(args):
+    import tarfile
+    url, size = BULK_SHARDS[args.bulk_shard]
+    if args.limit:
+        # only pull roughly as much of the archive as we need
+        size = min(size, int(args.limit * 48 * 1024 * 1.15))
+    con = open_db(args.db)
+    pool = None if args.raw else ProcessPoolExecutor(max_workers=args.workers)
+    reader = ParallelRangeReader(url, size, chunk=args.chunk << 20, lookahead=args.lookahead)
+    tf = tarfile.open(fileobj=reader, mode="r|")
+
+    t0 = time.time()
+    n_img = saved = 0
+    batch, inflight = [], []
+    import hashlib
+
+    def drain(fut):
+        nonlocal saved
+        rows = [(k, f"bulk:{args.bulk_shard}", "", c, "", "CC12M/xlsd", "", w, h, b)
+                for k, c, b, w, h in fut.result()]
+        con.executemany(
+            "INSERT OR IGNORE INTO samples (page_id,query,title,caption,artist,license,"
+            "source_url,width,height,image) VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+        con.commit()
+        saved += len(rows)
+
+    try:
+        for m in tf:
+            if not m.isfile() or not m.name.lower().endswith((".jpg", ".jpeg", ".png")):
+                continue
+            blob = tf.extractfile(m).read()
+            n_img += 1
+            key = int(hashlib.md5(m.name.encode()).hexdigest()[:15], 16)
+            if args.raw:
+                batch.append((key, "", blob))
+            else:
+                batch.append((key, "", blob))
+            if len(batch) >= args.batch:
+                if args.raw:
+                    con.executemany(
+                        "INSERT OR IGNORE INTO samples (page_id,query,title,caption,artist,"
+                        "license,source_url,width,height,image) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        [(k, f"bulk:{args.bulk_shard}", "", c, "", "CC12M/xlsd", "", 0, 0, b)
+                         for k, c, b in batch])
+                    con.commit()
+                    saved += len(batch)
+                else:
+                    inflight.append(pool.submit(_decode_batch, (batch, args.out_size, args.quality)))
+                    if len(inflight) >= args.workers * 3:
+                        drain(inflight.pop(0))
+                batch = []
+            if n_img % 2000 == 0:
+                el = time.time() - t0
+                print(f"  [{el:6.1f}s] read={n_img:7d} saved={saved:7d}  {n_img/el:7.1f} img/s  "
+                      f"{reader.bytes_read/el/1048576:6.1f} MB/s", flush=True)
+            if args.limit and n_img >= args.limit:
+                break
+    finally:
+        if batch and not args.raw:
+            inflight.append(pool.submit(_decode_batch, (batch, args.out_size, args.quality)))
+        elif batch:
+            con.executemany(
+                "INSERT OR IGNORE INTO samples (page_id,query,title,caption,artist,license,"
+                "source_url,width,height,image) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                [(k, f"bulk:{args.bulk_shard}", "", c, "", "CC12M/xlsd", "", 0, 0, b) for k, c, b in batch])
+            con.commit()
+            saved += len(batch)
+        for fut in inflight:
+            drain(fut)
+        try:
+            tf.close()
+        except Exception:
+            pass
+        reader.close()
+        if pool:
+            pool.shutdown()
+
+    el = time.time() - t0
+    total = con.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+    con.close()
+    print("-" * 72)
+    print(f"done in {el:.1f}s  read={n_img}  saved={saved}")
+    print(f"rate: {n_img/el:.0f} img/s   {reader.bytes_read/el/1048576:.1f} MB/s")
+    print(f"projected for 100,000 images: {100000*el/max(1,n_img):.0f}s")
+    print(f"db now holds {total} rows -> {args.db}")
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Fast Pexels photography scraper")
-    ap.add_argument("--source", default="janpf", choices=["janpf", "meta"])
+    ap = argparse.ArgumentParser(description="Fast photography scraper")
+    ap.add_argument("--source", default="janpf", choices=["janpf", "meta", "bulk"])
+    ap.add_argument("--bulk-shard", default="xlsd512", choices=list(BULK_SHARDS))
+    ap.add_argument("--chunk", type=int, default=16, help="bulk range-request chunk size (MB)")
+    ap.add_argument("--lookahead", type=int, default=16, help="bulk parallel range requests")
     ap.add_argument("--limit", type=int, default=2000)
     ap.add_argument("--width", type=int, default=512, help="CDN-side resize width")
     ap.add_argument("--out-size", type=int, default=256)
@@ -353,6 +557,9 @@ def main():
 
     print(f"source={args.source} limit={args.limit} width={args.width} "
           f"concurrency={args.concurrency} workers={args.workers} mode={'raw' if args.raw else 'decode'}")
+    if args.source == "bulk":
+        run_bulk(args)
+        return
     items = load_manifest(args.source, args.limit, args.width, args.caption_field, args.cache_dir)
     asyncio.run(run(items, args))
 
