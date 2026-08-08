@@ -7,3 +7,8 @@ model/dataset_hq.db-journal
 model/dataset_hq.db-wal
 model/dataset_hq.db-shm
 model/dataset_hq.db
+model/dataset_pexels.db
+model/dataset_pexels.db-wal
+model/dataset_pexels.db-shm
+model/dataset_pexels.db-journal
+model/.manifest_cache/
