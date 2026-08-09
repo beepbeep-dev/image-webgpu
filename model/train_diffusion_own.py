@@ -18,6 +18,7 @@ and meta.textEncoder="attn" so the JS side picks the new caption encoder.
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import io, json, re, sqlite3, time
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 import torch.nn as nn
@@ -38,22 +39,47 @@ LATENT_SIZE = 32
 LATENT_CH = 4
 
 # ---------------------------------------------------------------------------
-# Load all images once (7.6k x 256x256x3 uint8 ≈ 1.5GB RAM — fine).
+# Load the dataset as COMPRESSED JPEG bytes and decode lazily.
+#
+# The old version decoded everything up front into one uint8 array, which is
+# 256*256*3 = 192 KB of RAM per image. That was fine at 7.6k photos (1.5 GB)
+# but the dataset is now ~200k, which would be ~40 GB and OOM any box we
+# rent. Holding the JPEGs compressed is ~21 KB each (~4 GB at 200k) and
+# batches are decoded on demand in a thread pool -- Pillow drops the GIL
+# during decode, so threads genuinely overlap, and the AE batch (32 images)
+# decodes well inside a GPU step.
 # ---------------------------------------------------------------------------
-con = sqlite3.connect("dataset_hq.db")
-rows = con.execute("SELECT query, caption, image FROM samples").fetchall()
-con.close()
-N = len(rows)
-print("dataset:", N, "photos")
-IMGS = np.empty((N, 3, S, S), dtype=np.uint8)
-captions = []
-queries = []
-for i, (q, cap, blob) in enumerate(rows):
-    img = np.asarray(Image.open(io.BytesIO(blob)).convert("RGB"), dtype=np.uint8)
-    IMGS[i] = np.transpose(img, (2, 0, 1))
-    captions.append(cap)
-    queries.append(q)
-del rows
+DB_PATHS = [p for p in os.environ.get("DATASETS", "dataset_hq.db").split(",") if p.strip()]
+BLOBS, captions, queries = [], [], []
+for dbp in DB_PATHS:
+    if not os.path.exists(dbp):
+        print("  skip missing dataset:", dbp)
+        continue
+    con = sqlite3.connect(dbp)
+    n0 = len(BLOBS)
+    for q, cap, blob in con.execute("SELECT query, caption, image FROM samples"):
+        BLOBS.append(blob)
+        captions.append(cap or "")
+        queries.append(q or "")
+    con.close()
+    print(f"  {dbp}: +{len(BLOBS)-n0} rows")
+N = len(BLOBS)
+print("dataset:", N, "photos  (~%.1f GB compressed in RAM)" % (sum(map(len, BLOBS)) / 1e9))
+
+_decode_pool = ThreadPoolExecutor(max_workers=min(16, (os.cpu_count() or 4) * 2))
+
+
+def _decode_one(i):
+    im = Image.open(io.BytesIO(BLOBS[i]))
+    im.draft("RGB", (S, S))
+    im = im.convert("RGB")
+    if im.size != (S, S):
+        im = im.resize((S, S), Image.BILINEAR)
+    return np.transpose(np.asarray(im, dtype=np.uint8), (2, 0, 1))
+
+
+def decode_many(idx):
+    return np.stack(list(_decode_pool.map(_decode_one, idx)))
 
 # Oversample weight per row: aligned faces/bodies are a small slice of the
 # dataset but are the only rows with consistent scale/position (see
@@ -97,7 +123,7 @@ def sample_indices(rng, batch):
 
 
 def img_batch(idx):
-    x = torch.from_numpy(IMGS[idx].astype(np.float32) / 255.0).to(device)
+    x = torch.from_numpy(decode_many(idx).astype(np.float32) / 255.0).to(device)
     flip = torch.rand(len(idx), device=device) < 0.5
     return torch.where(flip[:, None, None, None], x.flip(-1), x)
 
@@ -145,7 +171,8 @@ print("[AE] done in %.1fs" % (time.time() - t0))
 lat_list = []
 with torch.no_grad():
     for i in range(0, N, 64):
-        x = torch.from_numpy(IMGS[i:i + 64].astype(np.float32) / 255.0).to(device)
+        chunk = np.arange(i, min(i + 64, N))
+        x = torch.from_numpy(decode_many(chunk).astype(np.float32) / 255.0).to(device)
         lat_list.append(enc(x).float().cpu())
 LATENTS = torch.cat(lat_list)
 LSCALE = 1.0 / float(LATENTS.std())
