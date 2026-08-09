@@ -125,9 +125,36 @@ diff_w = weight.copy()
 diff_w[is_bulk | ~has_caption] = 0
 if diff_w.sum() == 0:                      # no captioned rows at all -> fall back
     diff_w = weight.copy()
+
+# Pin the aligned face/body rows to a TARGET SHARE of the diffusion pool
+# rather than a fixed multiplier.
+#
+# A fixed multiplier silently weakens every time the dataset grows: at 34k
+# rows a 16x weight put the 229 face crops at 7.4% of each batch and the
+# model learned faces, but adding 62k Pexels photos pushed the same 16x down
+# to 2.7% and portrait quality visibly regressed. The share is what the model
+# actually experiences, so set that directly and let the multiplier fall out.
+ALIGNED_TARGET_SHARE = {"portrait_aligned:": 0.075, "person_aligned:": 0.140}
+for prefix, target in ALIGNED_TARGET_SHARE.items():
+    sel = np.array([q.startswith(prefix) for q in queries]) & (diff_w > 0)
+    n_sel = int(sel.sum())
+    if n_sel == 0:
+        continue
+    rest = float(diff_w[~sel].sum())
+    # solve share = n*w / (rest + n*w)  ->  w = share*rest / (n*(1-share))
+    w_needed = max(1.0, round(target * rest / (n_sel * (1.0 - target))))
+    diff_w[sel] = w_needed
+    print(f"  {prefix:18s} {n_sel:5d} rows -> weight {w_needed:.0f} "
+          f"(target {target*100:.1f}% of diffusion pool)")
+
 DIFF_POOL = np.repeat(np.arange(N), diff_w.astype(np.int64))
 print(f"pools: AE={len(AE_POOL)} samples over {N} rows | "
       f"diffusion={len(DIFF_POOL)} samples over {int((diff_w>0).sum())} captioned rows")
+for prefix in ALIGNED_TARGET_SHARE:
+    sel = np.array([q.startswith(prefix) for q in queries])
+    if sel.any():
+        print(f"  actual {prefix:18s} share: "
+              f"{100*diff_w[sel].sum()/max(1,diff_w.sum()):.2f}%")
 
 for name in ["portrait_aligned", "person_aligned"] + list(TOPIC_PATTERNS):
     if name in ("portrait_aligned", "person_aligned"):
