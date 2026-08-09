@@ -105,6 +105,30 @@ for i, (q, cap) in enumerate(zip(queries, captions)):
             if pat.search(cap or ""):
                 weight[i] = max(weight[i], w)
 
+# The two stages want different data, so they get different pools.
+#
+# The autoencoder is a compressor: it never sees a caption, and feeding it
+# the widest variety of real photographs makes it generalise better. The
+# diffusion model learns *what to generate*, so its training set decides the
+# aesthetic of every image the app produces.
+#
+# The bulk CC12M rows are genuine photographs but visibly more mundane than
+# the curated Pexels set (product shots, snapshots, posters), and they carry
+# no captions, so in stage 3 they would only ever act as unconditional
+# samples -- spending model capacity to make output *less* beautiful. So:
+# everything trains the AE, only captioned photos train the diffusion model.
+is_bulk = np.array([q.startswith("bulk:") for q in queries])
+has_caption = np.array([bool((c or "").strip()) for c in captions])
+
+AE_POOL = np.repeat(np.arange(N), weight.astype(np.int64))
+diff_w = weight.copy()
+diff_w[is_bulk | ~has_caption] = 0
+if diff_w.sum() == 0:                      # no captioned rows at all -> fall back
+    diff_w = weight.copy()
+DIFF_POOL = np.repeat(np.arange(N), diff_w.astype(np.int64))
+print(f"pools: AE={len(AE_POOL)} samples over {N} rows | "
+      f"diffusion={len(DIFF_POOL)} samples over {int((diff_w>0).sum())} captioned rows")
+
 for name in ["portrait_aligned", "person_aligned"] + list(TOPIC_PATTERNS):
     if name in ("portrait_aligned", "person_aligned"):
         n = sum(1 for q in queries if q.startswith(name + ":"))
@@ -113,13 +137,8 @@ for name in ["portrait_aligned", "person_aligned"] + list(TOPIC_PATTERNS):
         n = sum(1 for cap in captions if pat.search(cap or ""))
     print(f"{name} rows: {n}")
 
-# Build the sample pool by repeating each row index proportional to its
-# integer weight (weights here are all small integers, so this is exact).
-SAMPLE_POOL = np.repeat(np.arange(N), weight.astype(np.int64))
-
-
-def sample_indices(rng, batch):
-    return SAMPLE_POOL[rng.integers(0, len(SAMPLE_POOL), batch)]
+def sample_indices(rng, batch, pool):
+    return pool[rng.integers(0, len(pool), batch)]
 
 
 def img_batch(idx):
@@ -134,7 +153,7 @@ def img_batch(idx):
 enc = OwnEncoder(LATENT_CH).to(device)
 dec = OwnDecoder(LATENT_CH).to(device)
 print("AE params:", sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in dec.parameters()))
-AE_STEPS = 30000
+AE_STEPS = int(os.environ.get('AE_STEPS', 30000))
 AE_BATCH = 32
 ae_opt = torch.optim.AdamW(list(enc.parameters()) + list(dec.parameters()), lr=3e-4, weight_decay=0.01)
 
@@ -150,7 +169,7 @@ def edge_loss(a, b):
 t0 = time.time()
 ema_l = None
 for step in range(1, AE_STEPS + 1):
-    x = img_batch(sample_indices(rng, AE_BATCH))
+    x = img_batch(sample_indices(rng, AE_BATCH, AE_POOL))
     ae_opt.zero_grad()
     with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=use_amp):
         z = enc(x)
@@ -235,7 +254,7 @@ print(f"optimizer: AdamW (lr={LR}, weight_decay=0.01)")
 all_params = list(model.named_parameters()) + [("cap." + k, v) for k, v in cap_enc.named_parameters()]
 ema = {name: p.detach().clone() for name, p in all_params}
 
-STEPS = 60000
+STEPS = int(os.environ.get('STEPS', 60000))
 BATCH = 128 if device == "cuda" else 16
 LAT_T = LATENTS.to(device)
 IDS_T = torch.from_numpy(ids_arr).to(device)
@@ -276,7 +295,7 @@ def export_model():
 t0 = time.time()
 ema_loss = None
 for step in range(1, STEPS + 1):
-    idx = torch.from_numpy(sample_indices(rng, BATCH)).to(device)
+    idx = torch.from_numpy(sample_indices(rng, BATCH, DIFF_POOL)).to(device)
     x0 = LAT_T[idx]
     flip = torch.rand(BATCH, device=device) < 0.5
     x0 = torch.where(flip[:, None, None, None], x0.flip(-1), x0)
