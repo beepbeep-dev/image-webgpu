@@ -12,3 +12,4 @@ model/dataset_pexels.db-wal
 model/dataset_pexels.db-shm
 model/dataset_pexels.db-journal
 model/.manifest_cache/
+model/diffusion_hq_model*.json
