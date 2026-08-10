@@ -273,7 +273,11 @@ for i, toks in enumerate(token_lists):
         ids_arr[i, j] = tid
         mask_arr[i, j] = 1.0
 
-CHANNELS = (192, 288, 384)
+# 43.2M params (was 16.1M at (192,288,384)). 2.7x the compute per step, so
+# STEPS is raised with it -- this project's clearest failure was a 109M
+# pixel-space model at 12k steps producing pure static, and 21M only worked
+# once it got 60k. A bigger model on an unchanged step budget gets *worse*.
+CHANNELS = (320, 480, 640)
 EMB_DIM = 256
 model = LatentUNet(channels=CHANNELS, emb_dim=EMB_DIM, cdim=EMBED_DIM).to(device)
 cap_enc = CaptionEncoderV2(len(vocab), EMBED_DIM, MAXLEN).to(device)
@@ -290,7 +294,7 @@ print(f"optimizer: AdamW (lr={LR}, weight_decay=0.01)")
 all_params = list(model.named_parameters()) + [("cap." + k, v) for k, v in cap_enc.named_parameters()]
 ema = {name: p.detach().clone() for name, p in all_params}
 
-STEPS = int(os.environ.get('STEPS', 60000))
+STEPS = int(os.environ.get('STEPS', 90000))
 BATCH = 128 if device == "cuda" else 16
 LAT_T = LATENTS.to(device)
 IDS_T = torch.from_numpy(ids_arr).to(device)
@@ -307,6 +311,11 @@ def export_model():
         flat.append(v.detach().cpu().numpy().astype(np.float32).ravel())
     # OUR decoder, exported under the same key prefix/topology the browser
     # already runs (meta.decoder marks the provenance change).
+    for k, v in enc.state_dict().items():
+        key = "own_enc." + k
+        order.append(key)
+        shapes[key] = list(v.shape)
+        flat.append(v.detach().cpu().numpy().astype(np.float32).ravel())
     for k, v in dec.state_dict().items():
         key = "taesd_dec." + k
         order.append(key)
