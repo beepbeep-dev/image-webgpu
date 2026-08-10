@@ -135,17 +135,26 @@ if diff_w.sum() == 0:                      # no captioned rows at all -> fall ba
 # to 2.7% and portrait quality visibly regressed. The share is what the model
 # actually experiences, so set that directly and let the multiplier fall out.
 ALIGNED_TARGET_SHARE = {"portrait_aligned:": 0.075, "person_aligned:": 0.140}
+_sel_cache = {p: (np.array([q.startswith(p) for q in queries]) & (diff_w > 0))
+              for p in ALIGNED_TARGET_SHARE}
+# Iterate: each prefix's weight changes the pool the *other* prefix is a
+# share of, so a single pass lands short (portraits solve to 6.8% instead of
+# 7.5% once the body rows are re-weighted afterwards). Three passes is well
+# past the fixed point -- it converges by the second.
+for _ in range(3):
+    for prefix, target in ALIGNED_TARGET_SHARE.items():
+        sel = _sel_cache[prefix]
+        n_sel = int(sel.sum())
+        if n_sel == 0:
+            continue
+        rest = float(diff_w[~sel].sum())
+        # solve share = n*w / (rest + n*w)  ->  w = share*rest / (n*(1-share))
+        diff_w[sel] = max(1.0, round(target * rest / (n_sel * (1.0 - target))))
 for prefix, target in ALIGNED_TARGET_SHARE.items():
-    sel = np.array([q.startswith(prefix) for q in queries]) & (diff_w > 0)
-    n_sel = int(sel.sum())
-    if n_sel == 0:
-        continue
-    rest = float(diff_w[~sel].sum())
-    # solve share = n*w / (rest + n*w)  ->  w = share*rest / (n*(1-share))
-    w_needed = max(1.0, round(target * rest / (n_sel * (1.0 - target))))
-    diff_w[sel] = w_needed
-    print(f"  {prefix:18s} {n_sel:5d} rows -> weight {w_needed:.0f} "
-          f"(target {target*100:.1f}% of diffusion pool)")
+    sel = _sel_cache[prefix]
+    if sel.any():
+        print(f"  {prefix:18s} {int(sel.sum()):5d} rows -> weight {diff_w[sel][0]:.0f} "
+              f"(target {target*100:.1f}% of diffusion pool)")
 
 DIFF_POOL = np.repeat(np.arange(N), diff_w.astype(np.int64))
 print(f"pools: AE={len(AE_POOL)} samples over {N} rows | "
