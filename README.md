@@ -278,6 +278,26 @@ and a **third, bigger self-trained diffusion model** generating natively at
      body reliably looks like. Human anatomy needs far more image density
      than scenery to converge, and that's a compute/data scale problem, not
      something the architecture can fix.
+  9. **Curated photography, and a dilution bug.** The scrape sources so far
+     were legally clean but aesthetically mixed (documentary Wikimedia
+     shots, NASA frames, archive scans), and captions came from filenames.
+     `model/scrape_pexels_fast.py` replaced that with **62,140 Pexels
+     photographs**, each carrying a LLaVA-38B caption (~875 chars vs ~30),
+     plus 120,000 CC12M photos pulled from a bulk archive -- 216,302 images
+     total. Two things had to be fixed to use them. (a) The bulk CC12M rows
+     are real photos but visibly mundane (product shots, snapshots), so
+     they train the *autoencoder* only, while the diffusion model -- which
+     decides what generated images look like -- sees only curated captioned
+     photos. (b) More subtly, the 229 face-aligned crops were pinned at a
+     fixed 16x weight, which had put them at 7.4% of each diffusion batch
+     at 34k rows but silently fell to **2.7%** at 216k. Faces visibly
+     regressed. Weighting now targets a *share* of the pool and solves for
+     the multiplier (53x today), so it cannot decay as the dataset grows.
+     Result, A/B'd at equal seeds against the previous model: "a person on
+     a beach" went from a formless haze to a real beach with a figure,
+     desert/dune prompts improved clearly, faces held even, and a couple of
+     scene prompts (snowy peak, night street) came out slightly weaker.
+
   8. **Doubling the data again, on a shorter run.** The Openverse/NASA/LoC
      scrapes were run to completion, growing the dataset from 15,922 to
      **33,251 photos**. Retrained with a shorter 40k-step diffusion run
@@ -297,7 +317,7 @@ and a **third, bigger self-trained diffusion model** generating natively at
   on any device — **no WebGPU required**. The JS UNet forward, the TAESD
   decoder port, and the full sampling loop were all numerically verified
   against PyTorch (max abs diff ~3e-7 / ~8e-6).
-- **Honest limitation:** ~33k photos and 16M params is still ~5 orders of
+- **Honest limitation:** ~216k photos and 16M params is still ~4-5 orders of
   magnitude less data/compute than a real Stable Diffusion. Landscapes and
   scenes (where our training data is dense) come out genuinely
   photographic-looking; specific objects and creatures, and especially
