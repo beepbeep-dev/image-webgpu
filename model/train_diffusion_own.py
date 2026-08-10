@@ -311,11 +311,6 @@ def export_model():
         flat.append(v.detach().cpu().numpy().astype(np.float32).ravel())
     # OUR decoder, exported under the same key prefix/topology the browser
     # already runs (meta.decoder marks the provenance change).
-    for k, v in enc.state_dict().items():
-        key = "own_enc." + k
-        order.append(key)
-        shapes[key] = list(v.shape)
-        flat.append(v.detach().cpu().numpy().astype(np.float32).ravel())
     for k, v in dec.state_dict().items():
         key = "taesd_dec." + k
         order.append(key)
@@ -335,6 +330,10 @@ def export_model():
     with open(tmp, "w") as f:
         json.dump(out, f)
     os.replace(tmp, "diffusion_hq_model.json")
+    # The encoder is training-only: the browser needs just the decoder, so
+    # bundling it would ship ~6.5 MB of dead weight to every visitor. Save it
+    # beside the model so a future run can skip the 75-minute AE stage.
+    torch.save(enc.state_dict(), "own_encoder.pt")
 
 
 t0 = time.time()
