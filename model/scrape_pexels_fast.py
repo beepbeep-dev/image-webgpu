@@ -46,6 +46,8 @@ denial-of-service against someone else's CDN.
 """
 import argparse
 import asyncio
+import hashlib
+import json
 import io
 import os
 import re
@@ -176,6 +178,28 @@ def load_manifest(source, limit, width, caption_field, cache_dir):
             items.append((u, clean_caption(cap)))
             if limit and len(items) >= limit:
                 break
+    elif source == "cc12m":
+        # 631,331 photo-filtered CC12M images, each with a LLaVA caption.
+        # Unlike Pexels these live on ~19,500 different hosts, so throughput
+        # is not capped by one origin's rate limit -- it is bandwidth-bound
+        # instead, which is why this is the source that actually scales.
+        import gzip
+        p = fetch(
+            "https://huggingface.co/datasets/opendiffusionai/cc12m-1mp_plus-realistic/resolve/main/train.1mp%2B.jsonl.gz",
+            os.path.join(cache_dir, "cc12m_1mp.jsonl.gz"))
+        with gzip.open(p, "rt") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                u = (r.get("url") or "").strip()
+                cap = clean_caption(r.get("caption_llava_short") or r.get("caption_llava") or "")
+                if not u or not cap:
+                    continue
+                items.append((u, cap))
+                if limit and len(items) >= limit:
+                    break
     elif source == "meta":
         p = fetch(
             "https://huggingface.co/datasets/terminusresearch/pexels-metadata-1.71M/resolve/main/photos_sequential.parquet",
@@ -229,8 +253,11 @@ async def run(items, args):
     seen = {r[0] for r in con.execute("SELECT page_id FROM samples")}
     todo = []
     for u, cap in items:
+        # Pexels URLs carry a stable numeric photo id; everything else (CC12M
+        # lives on ~19,500 arbitrary hosts) gets a stable hash of the URL so
+        # dedupe and resume still work across sources.
         m = _ID_RE.search(u)
-        pid = int(m.group(1))
+        pid = int(m.group(1)) if m else int(hashlib.md5(u.encode()).hexdigest()[:15], 16)
         if pid not in seen:
             todo.append((pid, u, cap))
     print(f"manifest: {len(items)}  new: {len(todo)}  already in db: {len(items)-len(todo)}", flush=True)
@@ -535,7 +562,7 @@ def run_bulk(args):
 
 def main():
     ap = argparse.ArgumentParser(description="Fast photography scraper")
-    ap.add_argument("--source", default="janpf", choices=["janpf", "meta", "bulk"])
+    ap.add_argument("--source", default="janpf", choices=["janpf", "meta", "bulk", "cc12m"])
     ap.add_argument("--bulk-shard", default="xlsd512", choices=list(BULK_SHARDS))
     ap.add_argument("--chunk", type=int, default=16, help="bulk range-request chunk size (MB)")
     ap.add_argument("--lookahead", type=int, default=16, help="bulk parallel range requests")
